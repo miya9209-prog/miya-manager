@@ -894,86 +894,107 @@ def guess_column(df: pd.DataFrame, candidates):
 
 def normalize_log_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=[
+            "timestamp", "event_type", "session_id", "product_no", "product_name",
+            "user_text", "response_mode", "fallback_reason", "is_fallback",
+            "error_text", "latency_ms", "date", "is_error", "is_rate_limit"
+        ])
+
     out = df.copy()
     out.columns = [clean_text(c) for c in out.columns]
 
-    ts_col = guess_column(out, ["timestamp", "time", "created_at", "date"])
-    event_col = guess_column(out, ["event_type", "event", "type", "action"])
-    product_no_col = guess_column(out, ["product_no", "pn", "상품번호"])
-    product_name_col = guess_column(out, ["product_name", "상품명"])
-    fallback_col = guess_column(out, ["fallback", "임시답변", "temporary_answer", "safe_llm_fallback"])
-    error_col = guess_column(out, ["error", "rate_limit", "api_error", "timeout"])
-    latency_col = guess_column(out, ["latency", "duration", "response_ms", "elapsed"])
-    session_col = guess_column(out, ["session_id", "session", "conversation_id", "chat_id"])
-    user_text_col = guess_column(out, ["user_text", "user_message", "question", "query"])
-
+    expected_cols = [
+        "timestamp", "event_type", "session_id", "product_no", "product_name",
+        "user_text", "response_mode", "fallback_reason", "is_fallback",
+        "error_text", "latency_ms"
+    ]
     normalized = pd.DataFrame()
-    normalized["timestamp"] = pd.to_datetime(out[ts_col], errors="coerce") if ts_col else pd.NaT
-    normalized["date"] = normalized["timestamp"].dt.date.astype("string") if ts_col else ""
-    normalized["event_type"] = out[event_col].astype(str).map(clean_text) if event_col else ""
-    normalized["product_no"] = out[product_no_col].astype(str).map(clean_text) if product_no_col else ""
-    normalized["product_name"] = out[product_name_col].astype(str).map(clean_text) if product_name_col else ""
-    normalized["session_id"] = out[session_col].astype(str).map(clean_text) if session_col else ""
-    normalized["user_text"] = out[user_text_col].astype(str).map(clean_text) if user_text_col else ""
+    for col in expected_cols:
+        if col in out.columns:
+            normalized[col] = out[col]
+        else:
+            normalized[col] = "" if col not in ["is_fallback", "latency_ms"] else (False if col == "is_fallback" else pd.NA)
 
-    if latency_col:
-        normalized["latency_ms"] = pd.to_numeric(out[latency_col], errors="coerce")
-    else:
-        normalized["latency_ms"] = pd.NA
+    normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], errors="coerce")
+    normalized["event_type"] = normalized["event_type"].astype(str).map(clean_text)
+    normalized["session_id"] = normalized["session_id"].astype(str).map(clean_text)
+    normalized["product_no"] = normalized["product_no"].astype(str).map(clean_text)
+    normalized["product_name"] = normalized["product_name"].astype(str).map(clean_text)
+    normalized["user_text"] = normalized["user_text"].astype(str).map(clean_text)
+    normalized["response_mode"] = normalized["response_mode"].astype(str).map(clean_text).str.lower()
+    normalized["fallback_reason"] = normalized["fallback_reason"].astype(str).map(clean_text)
+    normalized["error_text"] = normalized["error_text"].astype(str).map(clean_text)
+    normalized["latency_ms"] = pd.to_numeric(normalized["latency_ms"], errors="coerce")
 
-    if fallback_col:
-        series = out[fallback_col].astype(str).str.lower().map(clean_text)
-        normalized["is_fallback"] = series.isin(["1", "true", "y", "yes", "fallback", "임시답변", "전환"])
+    fallback_series = normalized["is_fallback"]
+    if fallback_series.dtype != bool:
+        fallback_series = fallback_series.astype(str).str.lower().map(clean_text)
+        normalized["is_fallback"] = fallback_series.isin(["1", "true", "y", "yes"])
     else:
-        normalized["is_fallback"] = normalized["event_type"].str.contains("fallback|temporary", case=False, na=False)
+        normalized["is_fallback"] = fallback_series.fillna(False)
 
-    if error_col:
-        err_text = out[error_col].astype(str).map(clean_text)
-    else:
-        err_text = normalized["event_type"]
-    normalized["error_text"] = err_text
-    normalized["is_error"] = normalized["error_text"].str.contains("error|rate|timeout|fail", case=False, na=False)
+    normalized["is_fallback"] = normalized["is_fallback"] | normalized["event_type"].eq("fallback") | normalized["response_mode"].eq("fallback")
+    normalized["date"] = normalized["timestamp"].dt.date
+    normalized["is_error"] = normalized["event_type"].eq("error") | normalized["error_text"].ne("")
     normalized["is_rate_limit"] = normalized["error_text"].str.contains("rate", case=False, na=False)
 
-    if "url" in out.columns and (normalized["product_no"] == "").any():
-        mask = normalized["product_no"] == ""
+    # 빈 product_no 보정: 혹시 url 컬럼이 있으면 product_no 추출
+    if "url" in out.columns:
+        mask = normalized["product_no"].eq("")
         normalized.loc[mask, "product_no"] = out.loc[mask, "url"].astype(str).map(extract_product_no)
 
     return normalized
-
 
 def build_log_template():
     rows = [
         {
             "timestamp": "2026-03-30 09:10:11",
-            "event_type": "user_question",
+            "event_type": "user_message",
             "session_id": "sess_001",
             "product_no": "28628",
             "product_name": "쓰리 핀턱 소프트 배기핏 슬랙스",
             "user_text": "77도 가능할까요?",
+            "response_mode": "llm",
+            "fallback_reason": "",
+            "is_fallback": False,
+            "error_text": "",
+            "latency_ms": 0,
+        },
+        {
+            "timestamp": "2026-03-30 09:10:12",
+            "event_type": "assistant_response",
+            "session_id": "sess_001",
+            "product_no": "28628",
+            "product_name": "쓰리 핀턱 소프트 배기핏 슬랙스",
+            "user_text": "77도 가능할까요?",
+            "response_mode": "llm",
+            "fallback_reason": "",
             "is_fallback": False,
             "error_text": "",
             "latency_ms": 820,
         },
         {
-            "timestamp": "2026-03-30 09:10:12",
-            "event_type": "safe_llm_fallback",
-            "session_id": "sess_001",
-            "product_no": "28628",
-            "product_name": "쓰리 핀턱 소프트 배기핏 슬랙스",
-            "user_text": "77도 가능할까요?",
+            "timestamp": "2026-03-30 09:12:00",
+            "event_type": "fallback",
+            "session_id": "sess_002",
+            "product_no": "28659",
+            "product_name": "3타입 스트레치 핀턱 와이드 슬랙스",
+            "user_text": "77도 맞나요?",
+            "response_mode": "fallback",
+            "fallback_reason": "size_info_uncertain",
             "is_fallback": True,
             "error_text": "",
             "latency_ms": 1120,
         },
         {
-            "timestamp": "2026-03-30 09:12:00",
-            "event_type": "rate_limit_error",
-            "session_id": "sess_002",
+            "timestamp": "2026-03-30 09:13:40",
+            "event_type": "error",
+            "session_id": "sess_003",
             "product_no": "",
             "product_name": "",
             "user_text": "배송 얼마나 걸려요?",
+            "response_mode": "rule",
+            "fallback_reason": "",
             "is_fallback": False,
             "error_text": "RateLimitError",
             "latency_ms": 0,
@@ -981,6 +1002,140 @@ def build_log_template():
     ]
     return pd.DataFrame(rows)
 
+def load_logs_from_folder(folder_path: str) -> pd.DataFrame:
+    if not folder_path:
+        return pd.DataFrame()
+    if not os.path.isdir(folder_path):
+        return pd.DataFrame()
+    frames = []
+    for fname in sorted(os.listdir(folder_path)):
+        lower = fname.lower()
+        if not lower.endswith((".csv", ".xlsx", ".json", ".jsonl")):
+            continue
+        full = os.path.join(folder_path, fname)
+        try:
+            if lower.endswith(".csv"):
+                loaded = None
+                for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr"]:
+                    try:
+                        loaded = pd.read_csv(full, encoding=enc)
+                        break
+                    except Exception:
+                        continue
+                if loaded is None:
+                    continue
+            elif lower.endswith(".xlsx"):
+                loaded = pd.read_excel(full)
+            elif lower.endswith(".jsonl"):
+                rows = [json.loads(line) for line in Path(full).read_text(encoding="utf-8").splitlines() if clean_text(line)]
+                loaded = pd.DataFrame(rows)
+            else:
+                obj = json.loads(Path(full).read_text(encoding="utf-8"))
+                if isinstance(obj, list):
+                    loaded = pd.DataFrame(obj)
+                elif isinstance(obj, dict):
+                    for key in ["rows", "data", "logs", "items"]:
+                        if isinstance(obj.get(key), list):
+                            loaded = pd.DataFrame(obj[key])
+                            break
+                    else:
+                        loaded = pd.DataFrame([obj])
+                else:
+                    continue
+            if loaded is not None and not loaded.empty:
+                loaded["_source_file"] = fname
+                frames.append(loaded)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def filter_log_df(log_df: pd.DataFrame, date_range=None, event_types=None):
+    if log_df is None or log_df.empty:
+        return pd.DataFrame()
+    out = log_df.copy()
+    if date_range and len(date_range) == 2 and date_range[0] and date_range[1]:
+        start_date, end_date = date_range
+        out = out[(out["timestamp"].dt.date >= start_date) & (out["timestamp"].dt.date <= end_date)]
+    if event_types:
+        out = out[out["event_type"].isin(event_types)]
+    return out
+
+
+def compute_overall_metrics(log_df: pd.DataFrame) -> dict:
+    if log_df is None or log_df.empty:
+        return {
+            "total_consults": 0,
+            "fallback_count": 0,
+            "error_count": 0,
+            "avg_latency": None,
+            "daily_consults": pd.DataFrame(),
+        }
+    consult_mask = log_df["event_type"].eq("user_message")
+    total_consults = int(consult_mask.sum())
+    fallback_count = int(log_df["event_type"].eq("fallback").sum())
+    error_count = int(log_df["event_type"].eq("error").sum())
+    avg_latency = pd.to_numeric(log_df.loc[log_df["event_type"].eq("assistant_response"), "latency_ms"], errors="coerce").dropna().mean()
+    daily_consults = pd.DataFrame()
+    valid = log_df.dropna(subset=["timestamp"]).copy()
+    if not valid.empty:
+        daily_consults = valid[valid["event_type"].eq("user_message")].groupby(valid[valid["event_type"].eq("user_message")]["timestamp"].dt.date).size().to_frame("상담 수")
+    return {
+        "total_consults": total_consults,
+        "fallback_count": fallback_count,
+        "error_count": error_count,
+        "avg_latency": avg_latency,
+        "daily_consults": daily_consults,
+    }
+
+
+def compute_product_analysis(log_df: pd.DataFrame) -> pd.DataFrame:
+    if log_df is None or log_df.empty:
+        return pd.DataFrame(columns=["product_no", "product_name", "상품별 상담 수", "fallback 발생 횟수", "fallback 발생률(%)"])
+    base = log_df[log_df["product_no"].astype(str).ne("")].copy()
+    if base.empty:
+        return pd.DataFrame(columns=["product_no", "product_name", "상품별 상담 수", "fallback 발생 횟수", "fallback 발생률(%)"])
+    consults = base[base["event_type"].eq("user_message")].groupby(["product_no", "product_name"], dropna=False).size().to_frame("상품별 상담 수")
+    fallbacks = base[base["event_type"].eq("fallback")].groupby(["product_no", "product_name"], dropna=False).size().to_frame("fallback 발생 횟수")
+    merged = consults.join(fallbacks, how="outer").fillna(0).reset_index()
+    merged["상품별 상담 수"] = merged["상품별 상담 수"].astype(int)
+    merged["fallback 발생 횟수"] = merged["fallback 발생 횟수"].astype(int)
+    merged["fallback 발생률(%)"] = merged.apply(lambda r: round((r["fallback 발생 횟수"] / r["상품별 상담 수"] * 100), 1) if r["상품별 상담 수"] else 0.0, axis=1)
+    return merged.sort_values(["상품별 상담 수", "fallback 발생 횟수"], ascending=[False, False])
+
+
+def compute_quality_analysis(log_df: pd.DataFrame) -> dict:
+    if log_df is None or log_df.empty:
+        return {"fallback_ratio": 0.0, "response_mode_ratio": pd.DataFrame(), "error_logs": pd.DataFrame()}
+    total_consults = int(log_df["event_type"].eq("user_message").sum())
+    fallback_count = int(log_df["event_type"].eq("fallback").sum())
+    fallback_ratio = round((fallback_count / total_consults * 100), 1) if total_consults else 0.0
+    responses = log_df[log_df["event_type"].eq("assistant_response")].copy()
+    if responses.empty:
+        response_mode_ratio = pd.DataFrame(columns=["response_mode", "count", "ratio"])
+    else:
+        response_mode_ratio = responses["response_mode"].replace("", pd.NA).fillna("unknown").value_counts().reset_index()
+        response_mode_ratio.columns = ["response_mode", "count"]
+        response_mode_ratio["ratio"] = (response_mode_ratio["count"] / response_mode_ratio["count"].sum() * 100).round(1)
+    error_logs = log_df[log_df["event_type"].eq("error") | log_df["error_text"].ne("")][[
+        "timestamp", "session_id", "product_no", "product_name", "user_text", "error_text", "response_mode"
+    ]].copy()
+    return {"fallback_ratio": fallback_ratio, "response_mode_ratio": response_mode_ratio, "error_logs": error_logs}
+
+
+def merge_db_names(log_df: pd.DataFrame, db_df: pd.DataFrame) -> pd.DataFrame:
+    if log_df is None or log_df.empty:
+        return pd.DataFrame()
+    out = log_df.copy()
+    if db_df is not None and not db_df.empty and "product_no" in db_df.columns:
+        product_map = db_df[["product_no", "product_name"]].drop_duplicates()
+        out = out.merge(product_map, on="product_no", how="left", suffixes=("", "_db"))
+        out["product_name"] = out["product_name"].replace("", pd.NA).fillna(out.get("product_name_db", ""))
+        if "product_name_db" in out.columns:
+            out = out.drop(columns=["product_name_db"])
+    return out
 
 def get_today_log_df(log_df: pd.DataFrame) -> pd.DataFrame:
     if log_df is None or log_df.empty or "timestamp" not in log_df.columns:
@@ -1070,75 +1225,168 @@ def render_common_upload_bar(current_db_df: pd.DataFrame, log_df: pd.DataFrame):
     with up2:
         log_file = st.file_uploader("미야언니 V2 로그 업로드", type=["csv", "xlsx", "json", "jsonl"], key="log_file_top")
 
-    st.caption("로그 파일은 미야언니 V2에서 남긴 상담 로그 파일입니다. 최소 컬럼 예시는 timestamp, event_type, session_id, product_no, product_name, user_text, is_fallback, error_text, latency_ms 입니다.")
+    folder_cols = st.columns([1.5, 1])
+    with folder_cols[0]:
+        folder_default = os.path.join(os.getcwd(), "logs")
+        folder_path = st.text_input("또는 logs 폴더 직접 읽기", value=folder_default, help="앱 폴더 안 logs 경로 또는 서버 내 로그 폴더 경로를 입력하세요.")
+    with folder_cols[1]:
+        use_folder = st.checkbox("logs 폴더 읽기 사용", value=False)
+
+    st.caption(
+        "미야언니 V2 로그 구조는 그대로 유지해서 읽습니다. "
+        "필수 기준 컬럼: timestamp, event_type, session_id, product_no, product_name, user_text, response_mode, fallback_reason, is_fallback, error_text, latency_ms"
+    )
+
+    if current_db_file is not None:
+        current_db_df = ensure_db_columns(parse_uploaded_table(current_db_file))
 
     if log_file is not None:
         raw_log_df = parse_uploaded_table(log_file)
         log_df = normalize_log_df(raw_log_df) if raw_log_df is not None and not raw_log_df.empty else pd.DataFrame()
-    if current_db_file is not None:
-        current_db_df = ensure_db_columns(parse_uploaded_table(current_db_file))
+    elif use_folder:
+        raw_log_df = load_logs_from_folder(folder_path)
+        log_df = normalize_log_df(raw_log_df) if raw_log_df is not None and not raw_log_df.empty else pd.DataFrame()
 
     return current_db_df, log_df
 
-
 def render_dashboard(db_df: pd.DataFrame, log_df: pd.DataFrame):
     st.subheader("메인 대시보드")
-    st.caption("첫 화면은 DB가 아니라 상담 운영 상태를 바로 보는 화면으로 구성했습니다.")
+    st.caption("총 상담 수, 일별 상담 수, fallback/error, 평균 응답속도를 한눈에 보는 화면입니다.")
 
-    metrics = compute_chat_metrics(log_df)
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("오늘 상담수", f"{metrics['today_consults']:,}")
-    c2.metric("오늘 상담세션", f"{metrics['today_sessions']:,}")
-    c3.metric("평균 상담시간(ms)", f"{metrics['avg_latency']:,.0f}" if pd.notna(metrics['avg_latency']) else "-")
-    c4.metric("임시답변 전환", f"{metrics['fallback_count']:,}")
-    c5.metric("에러 수", f"{metrics['error_count']:,}")
-    c6.metric("RateLimit", f"{metrics['rate_limit_count']:,}")
+    log_df = merge_db_names(log_df, db_df)
+    metrics = compute_overall_metrics(log_df)
 
-    a, b = st.columns([1.5, 1])
-    with a:
-        st.markdown("##### 일별 상담 추이")
-        if metrics["daily"] is not None and not metrics["daily"].empty:
-            st.line_chart(metrics["daily"][["상담수", "임시답변전환", "에러"]])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("총 상담 수", f"{metrics['total_consults']:,}")
+    c2.metric("fallback 발생 횟수", f"{metrics['fallback_count']:,}")
+    c3.metric("error 발생 횟수", f"{metrics['error_count']:,}")
+    c4.metric("평균 응답 속도(ms)", f"{metrics['avg_latency']:,.0f}" if pd.notna(metrics['avg_latency']) else "-")
+
+    st.markdown("##### 일별 상담 수")
+    if metrics["daily_consults"] is not None and not metrics["daily_consults"].empty:
+        st.line_chart(metrics["daily_consults"])
+        daily_table = metrics["daily_consults"].reset_index()
+        daily_table.columns = ["날짜", "상담 수"]
+        st.dataframe(daily_table, use_container_width=True, hide_index=True)
+    else:
+        st.info("로그를 업로드하면 일별 상담 수가 표시됩니다.")
+
+    st.markdown("##### 빠른 운영 요약")
+    lower1, lower2 = st.columns(2)
+    with lower1:
+        product_top = compute_product_analysis(log_df).head(10)
+        st.markdown("###### 많이 질문되는 상품 TOP")
+        if not product_top.empty:
+            st.dataframe(product_top[["product_no", "product_name", "상품별 상담 수", "fallback 발생률(%)"]], use_container_width=True, hide_index=True, height=320)
         else:
-            st.info("상담 로그를 올리면 여기서 일별 상담 추이를 바로 볼 수 있습니다.")
-    with b:
-        st.markdown("##### 로그 업로드는 이렇게")
+            st.info("상품별 상담 데이터가 아직 없습니다.")
+    with lower2:
+        quality = compute_quality_analysis(log_df)
+        st.markdown("###### 오류 발생 로그")
+        if not quality["error_logs"].empty:
+            st.dataframe(quality["error_logs"].head(10), use_container_width=True, hide_index=True, height=320)
+        else:
+            st.info("오류 로그가 없습니다.")
+
+def render_product_analysis(db_df: pd.DataFrame, log_df: pd.DataFrame):
+    st.subheader("상품 분석")
+    st.caption("상품별 상담 수, 상품별 fallback 발생률, 많이 질문되는 상품을 확인합니다.")
+    log_df = merge_db_names(log_df, db_df)
+    product_stats = compute_product_analysis(log_df)
+    if product_stats.empty:
+        st.info("상품 로그가 아직 없습니다.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("##### 많이 질문되는 상품 TOP")
+        st.dataframe(product_stats.head(20), use_container_width=True, hide_index=True, height=420)
+    with c2:
+        st.markdown("##### fallback 발생률 높은 상품")
+        high_fallback = product_stats[product_stats["상품별 상담 수"] > 0].sort_values(["fallback 발생률(%)", "fallback 발생 횟수"], ascending=[False, False]).head(20)
+        st.dataframe(high_fallback, use_container_width=True, hide_index=True, height=420)
+
+def render_quality_analysis(log_df: pd.DataFrame):
+    st.subheader("상담 품질 분석")
+    st.caption("fallback 비율, response_mode 비율, 오류 발생 로그를 확인합니다.")
+    quality = compute_quality_analysis(log_df)
+    c1, c2 = st.columns(2)
+    c1.metric("fallback 비율", f"{quality['fallback_ratio']:.1f}%")
+    response_modes = quality["response_mode_ratio"]
+    if response_modes.empty:
+        c2.metric("response_mode 비율", "-")
+    else:
+        top_mode = response_modes.iloc[0]
+        c2.metric("주요 response_mode", f"{top_mode['response_mode']} ({top_mode['ratio']:.1f}%)")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("##### response_mode 비율")
+        if not response_modes.empty:
+            chart_df = response_modes.set_index("response_mode")[["count"]]
+            st.bar_chart(chart_df)
+            st.dataframe(response_modes, use_container_width=True, hide_index=True)
+        else:
+            st.info("assistant_response 로그가 없어서 response_mode 비율을 아직 계산할 수 없습니다.")
+    with right:
+        st.markdown("##### 오류 발생 로그 목록")
+        if not quality["error_logs"].empty:
+            st.dataframe(quality["error_logs"], use_container_width=True, hide_index=True, height=420)
+        else:
+            st.info("오류 로그가 없습니다.")
+
+def render_log_view(log_df: pd.DataFrame):
+    st.subheader("로그 조회")
+    st.caption("날짜별 / 이벤트 타입별 필터로 전체 로그를 확인합니다.")
+    template = build_log_template()
+    helper1, helper2 = st.columns([1.3, 1])
+    with helper1:
+        st.markdown("##### 로그 업로드 안내")
         st.markdown(
-            "- 미야언니 V2가 남긴 상담 로그 파일을 올리면 됩니다\n"
-            "- 형식: CSV / XLSX / JSON / JSONL\n"
-            "- 최소 권장 컬럼: `timestamp`, `event_type`, `session_id`, `product_no`, `product_name`, `user_text`, `is_fallback`, `error_text`, `latency_ms`\n"
-            "- 아직 로그 파일이 없으면 아래 템플릿을 먼저 내려받아 구조를 맞추시면 됩니다"
+            "- 기본 방식은 CSV 업로드입니다.\n"
+            "- 또는 앱 폴더 안 `logs` 폴더를 직접 읽을 수 있습니다.\n"
+            "- event_type은 `user_message / assistant_response / fallback / error` 구조를 그대로 사용합니다."
         )
-        template = build_log_template()
+    with helper2:
         st.download_button(
             "로그 템플릿 다운로드",
             data=template.to_csv(index=False).encode("utf-8-sig"),
             file_name="miya_v2_log_template.csv",
             mime="text/csv",
             use_container_width=True,
+            key="log_view_template_download",
         )
 
-    lower1, lower2 = st.columns(2)
-    with lower1:
-        st.markdown("##### 오늘 많이 상담된 상품")
-        if metrics["top_products"] is not None and not metrics["top_products"].empty:
-            st.dataframe(metrics["top_products"], use_container_width=True, height=320)
-        else:
-            st.info("오늘 로그 기준 상품별 상담수가 여기에 표시됩니다.")
-    with lower2:
-        st.markdown("##### 오늘 자주 나온 질문")
-        if metrics["top_questions"] is not None and not metrics["top_questions"].empty:
-            st.dataframe(metrics["top_questions"], use_container_width=True, hide_index=True, height=320)
-        else:
-            st.info("오늘 고객 질문이 누적되면 자주 나온 질문이 여기에 표시됩니다.")
+    if log_df is None or log_df.empty:
+        st.info("로그 파일을 업로드하거나 logs 폴더 읽기를 사용하면 여기에 전체 로그가 표시됩니다.")
+        return
 
-    st.markdown("##### DB 현황 요약")
-    d1, d2, d3, d4 = st.columns(4)
-    d1.metric("현재 DB 상품 수", f"{len(db_df):,}" if db_df is not None else "0")
-    d2.metric("사이즈 누락", f"{int((db_df['size_range'] == '').sum()):,}" if db_df is not None and not db_df.empty else "0")
-    d3.metric("컬러 누락", f"{int((db_df['color_options'] == '').sum()):,}" if db_df is not None and not db_df.empty else "0")
-    d4.metric("실측 누락", f"{int((db_df['measurement_source'] == '').sum()):,}" if db_df is not None and not db_df.empty else "0")
+    valid_ts = log_df.dropna(subset=["timestamp"])
+    if not valid_ts.empty:
+        min_date = valid_ts["timestamp"].dt.date.min()
+        max_date = valid_ts["timestamp"].dt.date.max()
+        default_range = (min_date, max_date)
+    else:
+        today = datetime.now().date()
+        default_range = (today, today)
 
+    filter1, filter2 = st.columns(2)
+    with filter1:
+        date_range = st.date_input("날짜 범위", value=default_range, key="log_date_range")
+    with filter2:
+        event_options = [x for x in ["user_message", "assistant_response", "fallback", "error"] if x in set(log_df["event_type"].dropna().astype(str))]
+        selected_events = st.multiselect("이벤트 타입 필터", options=event_options, default=event_options, key="log_event_filter")
+
+    filtered = filter_log_df(log_df, date_range=date_range, event_types=selected_events)
+    st.markdown(f"##### 전체 로그 테이블 ({len(filtered):,}건)")
+    st.dataframe(filtered, use_container_width=True, hide_index=True, height=520)
+    st.download_button(
+        "필터 결과 CSV 다운로드",
+        data=filtered.to_csv(index=False).encode("utf-8-sig"),
+        file_name="miya_v2_logs_filtered.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="filtered_logs_download",
+    )
 
 def render_db_generation():
     st.subheader("자동 상품DB 생성")
@@ -1180,13 +1428,13 @@ def render_db_generation():
         df, audit = analyze_urls(input_text, use_openai, delay_sec, max_products)
         st.success(f"최종 DB 행 수: {len(df)}")
         st.dataframe(df, use_container_width=True, height=420)
-        st.download_button("misharp_miya_db.csv 다운로드", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db.csv", mime="text/csv", use_container_width=True)
+        st.download_button("misharp_miya_db.csv 다운로드", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db.csv", mime="text/csv", use_container_width=True, key="db_generation_download")
 
         if audit:
             audit_df = pd.DataFrame(audit)
             st.markdown("##### 수집 감사 로그")
             st.dataframe(audit_df, use_container_width=True)
-            st.download_button("audit CSV 다운로드", data=audit_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db_audit.csv", mime="text/csv", use_container_width=True)
+            st.download_button("audit CSV 다운로드", data=audit_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db_audit.csv", mime="text/csv", use_container_width=True, key="db_audit_download")
 
 
 def render_db_compare(current_db_df: pd.DataFrame):
@@ -1222,8 +1470,8 @@ def render_db_compare(current_db_df: pd.DataFrame):
 
     st.markdown("##### 반영용 파일 다운로드")
     dl1, dl2 = st.columns(2)
-    dl1.download_button("전체 교체용 misharp_miya_db.csv 다운로드", data=new_db_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db.csv", mime="text/csv", use_container_width=True)
-    dl2.download_button("신규 상품만 별도 다운로드", data=added_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db_new_only.csv", mime="text/csv", use_container_width=True)
+    dl1.download_button("전체 교체용 misharp_miya_db.csv 다운로드", data=new_db_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db.csv", mime="text/csv", use_container_width=True, key="compare_full_db_download")
+    dl2.download_button("신규 상품만 별도 다운로드", data=added_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db_new_only.csv", mime="text/csv", use_container_width=True, key="compare_added_only_download")
 
     st.markdown("##### 실무 반영 순서")
     st.markdown(
@@ -1235,70 +1483,11 @@ def render_db_compare(current_db_df: pd.DataFrame):
 
 
 def render_stats(log_df: pd.DataFrame, db_df: pd.DataFrame):
-    st.subheader("미야언니 V2 통계 분석")
-    st.caption("상담 로그를 올리면 상품별 상담량, 임시답변 전환, 에러, 응답속도를 분석합니다.")
-
-    guide1, guide2 = st.columns([1.3, 1])
-    with guide1:
-        st.markdown("##### 어떤 로그를 올리면 되나요?")
-        st.markdown(
-            "- 미야언니 V2에서 남긴 상담 이벤트 로그 파일\n"
-            "- 한 줄에 한 이벤트가 쌓이는 CSV/JSONL 형태가 가장 좋습니다\n"
-            "- 추천 이벤트: user_question, chatbot_answer, safe_llm_fallback, rate_limit_error\n"
-            "- 컬럼은 최소한 `timestamp`, `event_type`, `session_id`, `product_no`, `product_name`, `user_text`, `is_fallback`, `error_text`, `latency_ms` 정도가 있으면 좋습니다"
-        )
-    with guide2:
-        template = build_log_template()
-        st.download_button("로그 템플릿 다운로드", data=template.to_csv(index=False).encode("utf-8-sig"), file_name="miya_v2_log_template.csv", mime="text/csv", use_container_width=True)
-        st.dataframe(template, use_container_width=True, hide_index=True, height=220)
-
-    if log_df is None or log_df.empty:
-        st.info("아직 로그 파일이 올라오지 않았습니다. 위 템플릿 구조에 맞춘 파일을 올리면 바로 분석됩니다.")
-        return
-
-    m1, m2, m3, m4, m5 = st.columns(5)
-    total_logs = len(log_df)
-    fallback_cnt = int(log_df["is_fallback"].sum())
-    error_cnt = int(log_df["is_error"].sum())
-    rate_cnt = int(log_df["is_rate_limit"].sum())
-    avg_latency = pd.to_numeric(log_df["latency_ms"], errors="coerce").dropna().mean()
-    m1.metric("총 로그", f"{total_logs:,}")
-    m2.metric("임시답변 전환", f"{fallback_cnt:,}", f"{(fallback_cnt / total_logs * 100):.1f}%" if total_logs else None)
-    m3.metric("에러", f"{error_cnt:,}", f"{(error_cnt / total_logs * 100):.1f}%" if total_logs else None)
-    m4.metric("RateLimit", f"{rate_cnt:,}")
-    m5.metric("평균 응답(ms)", f"{avg_latency:,.0f}" if pd.notna(avg_latency) else "-")
-
-    if log_df["timestamp"].notna().any():
-        st.markdown("##### 일별 로그 추이")
-        daily_src = log_df.dropna(subset=["timestamp"]).copy()
-        daily = daily_src.groupby(daily_src["timestamp"].dt.date).agg(total=("event_type", "size"), fallback=("is_fallback", "sum"), error=("is_error", "sum"))
-        st.line_chart(daily)
-
-    st.markdown("##### 상품별 상담/이상 징후")
-    product_stats = log_df.copy()
-    if db_df is not None and not db_df.empty and "product_no" in db_df.columns:
-        product_map = db_df[["product_no", "product_name"]].drop_duplicates()
-        product_stats = product_stats.merge(product_map, on="product_no", how="left", suffixes=("", "_db"))
-        product_stats["product_name"] = product_stats["product_name"].replace("", pd.NA).fillna(product_stats.get("product_name_db", ""))
-
-    grouped = product_stats[product_stats["product_no"].astype(str) != ""].groupby(["product_no", "product_name"], dropna=False).agg(
-        상담수=("event_type", "size"),
-        임시답변전환=("is_fallback", "sum"),
-        에러수=("is_error", "sum"),
-        평균응답ms=("latency_ms", "mean"),
-    ).reset_index().sort_values(["상담수", "임시답변전환"], ascending=[False, False])
-    st.dataframe(grouped.head(50), use_container_width=True, height=380)
-
-    st.markdown("##### 자주 나온 질문 원문")
-    if "user_text" in log_df.columns:
-        questions = log_df[log_df["user_text"].astype(str) != ""]["user_text"].value_counts().head(20).reset_index()
-        questions.columns = ["질문", "횟수"]
-        st.dataframe(questions, use_container_width=True, hide_index=True)
-
+    render_quality_analysis(log_df)
 
 def main():
     st.title("미야언니 관리프로그램")
-    st.caption("자동 상품DB 생성 · 반자동 DB업로드 준비 · 미야언니 V2 통계 분석")
+    st.caption("자동 상품DB 생성 · 반자동 DB업로드 준비 · 미야언니 V2 로그 기반 통계/품질 분석")
 
     st.markdown(
         """
@@ -1316,18 +1505,25 @@ def main():
     log_df = pd.DataFrame()
     current_db_df, log_df = render_common_upload_bar(current_db_df, log_df)
 
-    tab1, tab2, tab3, tab4 = st.tabs(["메인 대시보드", "자동 상품DB 생성", "반자동 DB업로드 준비", "미야언니 V2 통계 분석"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "메인 대시보드", "상품 분석", "상담 품질 분석", "로그 조회", "자동 상품DB 생성", "반자동 DB업로드 준비"
+    ])
     with tab1:
         render_dashboard(current_db_df, log_df)
     with tab2:
-        render_db_generation()
+        render_product_analysis(current_db_df, log_df)
     with tab3:
-        render_db_compare(current_db_df)
+        render_quality_analysis(log_df)
     with tab4:
-        render_stats(log_df, current_db_df)
+        render_log_view(log_df)
+    with tab5:
+        render_db_generation()
+    with tab6:
+        render_db_compare(current_db_df)
 
     st.markdown("---")
     st.caption("made by MISHARP COMPANY, MIYAWA. 2006. All rights reserved.")
+
 
 
 if __name__ == "__main__":
