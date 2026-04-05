@@ -836,10 +836,10 @@ def parse_uploaded_table(uploaded_file):
     if name.endswith(".xlsx"):
         uploaded_file.seek(0)
         return pd.read_excel(uploaded_file)
-    if name.endswith(".jsonl"):
+    if name.endswith(".jsonl") or name.endswith(".log"):
         uploaded_file.seek(0)
-        rows = [json.loads(line) for line in uploaded_file.read().decode("utf-8").splitlines() if clean_text(line)]
-        return pd.DataFrame(rows)
+        text = uploaded_file.read().decode("utf-8", errors="replace")
+        return _parse_jsonl_log(text)
     if name.endswith(".json"):
         uploaded_file.seek(0)
         obj = json.load(uploaded_file)
@@ -892,58 +892,91 @@ def guess_column(df: pd.DataFrame, candidates):
     return None
 
 
+def _parse_jsonl_log(text: str) -> pd.DataFrame:
+    """미야언니 V2 JSONL 구조화 로그 파싱"""
+    rows = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            # JSON 파싱 실패 시 탭 구분 레거시 포맷 시도
+            parts = line.split("\t")
+            if len(parts) >= 4:
+                ts_str = parts[0].strip()
+                role = parts[1].strip() if len(parts) > 1 else ""
+                pno = parts[2].strip() if len(parts) > 2 else ""
+                content = parts[3].strip() if len(parts) > 3 else ""
+                event_map = {"USER": "user_message", "MIYA": "assistant_response", "LLM_ERROR": "error"}
+                rows.append({
+                    "timestamp": ts_str,
+                    "event_type": event_map.get(role, role),
+                    "product_no": pno,
+                    "user_text": content if role == "USER" else "",
+                    "bot_text": content if role == "MIYA" else "",
+                    "error_text": content if role == "LLM_ERROR" else "",
+                })
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
 def normalize_log_df(df: pd.DataFrame) -> pd.DataFrame:
+    """미야언니 V2 구조화 로그 → 관리프로그램 표준 형식으로 변환"""
+    EMPTY_COLS = [
+        "timestamp", "event_type", "session_id", "product_no", "product_name",
+        "user_text", "bot_text", "response_mode", "fallback_reason", "is_fallback",
+        "error_text", "latency_ms", "date", "is_error", "is_rate_limit",
+    ]
     if df is None or df.empty:
-        return pd.DataFrame(columns=[
-            "timestamp", "event_type", "session_id", "product_no", "product_name",
-            "user_text", "response_mode", "fallback_reason", "is_fallback",
-            "error_text", "latency_ms", "date", "is_error", "is_rate_limit"
-        ])
+        return pd.DataFrame(columns=EMPTY_COLS)
 
     out = df.copy()
     out.columns = [clean_text(c) for c in out.columns]
 
-    expected_cols = [
-        "timestamp", "event_type", "session_id", "product_no", "product_name",
-        "user_text", "response_mode", "fallback_reason", "is_fallback",
-        "error_text", "latency_ms"
-    ]
-    normalized = pd.DataFrame()
-    for col in expected_cols:
-        if col in out.columns:
-            normalized[col] = out[col]
-        else:
-            normalized[col] = "" if col not in ["is_fallback", "latency_ms"] else (False if col == "is_fallback" else pd.NA)
+    # ── 필수 컬럼 보장
+    str_cols = ["event_type", "session_id", "product_no", "product_name",
+                "user_text", "bot_text", "response_mode", "fallback_reason", "error_text"]
+    for col in str_cols:
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].astype(str).map(clean_text)
 
-    normalized["timestamp"] = pd.to_datetime(normalized["timestamp"], errors="coerce")
-    normalized["event_type"] = normalized["event_type"].astype(str).map(clean_text)
-    normalized["session_id"] = normalized["session_id"].astype(str).map(clean_text)
-    normalized["product_no"] = normalized["product_no"].astype(str).map(clean_text)
-    normalized["product_name"] = normalized["product_name"].astype(str).map(clean_text)
-    normalized["user_text"] = normalized["user_text"].astype(str).map(clean_text)
-    normalized["response_mode"] = normalized["response_mode"].astype(str).map(clean_text).str.lower()
-    normalized["fallback_reason"] = normalized["fallback_reason"].astype(str).map(clean_text)
-    normalized["error_text"] = normalized["error_text"].astype(str).map(clean_text)
-    normalized["latency_ms"] = pd.to_numeric(normalized["latency_ms"], errors="coerce")
+    # event_type 정규화
+    etype_map = {
+        "user": "user_message", "user_msg": "user_message", "question": "user_message",
+        "assistant": "assistant_response", "miya": "assistant_response", "response": "assistant_response",
+        "llm_error": "error", "rate_limit": "error",
+    }
+    out["event_type"] = out["event_type"].str.lower().replace(etype_map).fillna("unknown")
 
-    fallback_series = normalized["is_fallback"]
-    if fallback_series.dtype != bool:
-        fallback_series = fallback_series.astype(str).str.lower().map(clean_text)
-        normalized["is_fallback"] = fallback_series.isin(["1", "true", "y", "yes"])
-    else:
-        normalized["is_fallback"] = fallback_series.fillna(False)
+    # timestamp
+    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
 
-    normalized["is_fallback"] = normalized["is_fallback"] | normalized["event_type"].eq("fallback") | normalized["response_mode"].eq("fallback")
-    normalized["date"] = normalized["timestamp"].dt.date
-    normalized["is_error"] = normalized["event_type"].eq("error") | normalized["error_text"].ne("")
-    normalized["is_rate_limit"] = normalized["error_text"].str.contains("rate", case=False, na=False)
+    # latency_ms
+    if "latency_ms" not in out.columns:
+        out["latency_ms"] = pd.NA
+    out["latency_ms"] = pd.to_numeric(out["latency_ms"], errors="coerce")
 
-    # 빈 product_no 보정: 혹시 url 컬럼이 있으면 product_no 추출
+    # is_fallback
+    if "is_fallback" not in out.columns:
+        out["is_fallback"] = False
+    fb = out["is_fallback"]
+    if fb.dtype != bool:
+        out["is_fallback"] = fb.astype(str).str.lower().isin(["1", "true", "yes", "y"])
+    out["is_fallback"] = out["is_fallback"].fillna(False) | out["event_type"].eq("fallback") | out["response_mode"].str.contains("fallback", na=False)
+
+    # 파생 컬럼
+    out["date"] = out["timestamp"].dt.date
+    out["is_error"] = out["event_type"].eq("error") | out["error_text"].ne("")
+    out["is_rate_limit"] = out["error_text"].str.contains("rate|RateLimit", case=False, na=False)
+
+    # product_no URL 보정
     if "url" in out.columns:
-        mask = normalized["product_no"].eq("")
-        normalized.loc[mask, "product_no"] = out.loc[mask, "url"].astype(str).map(extract_product_no)
+        mask = out["product_no"].eq("")
+        out.loc[mask, "product_no"] = out.loc[mask, "url"].astype(str).map(extract_product_no)
 
-    return normalized
+    return out[EMPTY_COLS + [c for c in out.columns if c not in EMPTY_COLS]]
 
 def build_log_template():
     rows = [
@@ -1003,6 +1036,7 @@ def build_log_template():
     return pd.DataFrame(rows)
 
 def load_logs_from_folder(folder_path: str) -> pd.DataFrame:
+    """logs 폴더의 JSONL/CSV/XLSX/JSON 로그 파일 전체 로드"""
     if not folder_path:
         return pd.DataFrame()
     if not os.path.isdir(folder_path):
@@ -1010,11 +1044,15 @@ def load_logs_from_folder(folder_path: str) -> pd.DataFrame:
     frames = []
     for fname in sorted(os.listdir(folder_path)):
         lower = fname.lower()
-        if not lower.endswith((".csv", ".xlsx", ".json", ".jsonl")):
+        # .log 확장자(레거시 탭 구분 로그)도 지원
+        if not lower.endswith((".csv", ".xlsx", ".json", ".jsonl", ".log")):
             continue
         full = os.path.join(folder_path, fname)
         try:
-            if lower.endswith(".csv"):
+            if lower.endswith((".jsonl", ".log")):
+                text = open(full, encoding="utf-8", errors="replace").read()
+                loaded = _parse_jsonl_log(text)
+            elif lower.endswith(".csv"):
                 loaded = None
                 for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr"]:
                     try:
@@ -1026,22 +1064,23 @@ def load_logs_from_folder(folder_path: str) -> pd.DataFrame:
                     continue
             elif lower.endswith(".xlsx"):
                 loaded = pd.read_excel(full)
-            elif lower.endswith(".jsonl"):
-                rows = [json.loads(line) for line in Path(full).read_text(encoding="utf-8").splitlines() if clean_text(line)]
-                loaded = pd.DataFrame(rows)
-            else:
-                obj = json.loads(Path(full).read_text(encoding="utf-8"))
-                if isinstance(obj, list):
-                    loaded = pd.DataFrame(obj)
-                elif isinstance(obj, dict):
-                    for key in ["rows", "data", "logs", "items"]:
-                        if isinstance(obj.get(key), list):
-                            loaded = pd.DataFrame(obj[key])
-                            break
+            else:  # .json
+                text = open(full, encoding="utf-8", errors="replace").read()
+                try:
+                    obj = json.loads(text)
+                    if isinstance(obj, list):
+                        loaded = pd.DataFrame(obj)
+                    elif isinstance(obj, dict):
+                        for key in ["rows", "data", "logs", "items"]:
+                            if isinstance(obj.get(key), list):
+                                loaded = pd.DataFrame(obj[key])
+                                break
+                        else:
+                            loaded = pd.DataFrame([obj])
                     else:
-                        loaded = pd.DataFrame([obj])
-                else:
-                    continue
+                        continue
+                except Exception:
+                    loaded = _parse_jsonl_log(text)  # JSON Lines 재시도
             if loaded is not None and not loaded.empty:
                 loaded["_source_file"] = fname
                 frames.append(loaded)
@@ -1073,7 +1112,7 @@ def compute_overall_metrics(log_df: pd.DataFrame) -> dict:
             "avg_latency": None,
             "daily_consults": pd.DataFrame(),
         }
-    consult_mask = log_df["event_type"].eq("user_message")
+    consult_mask = log_df["event_type"].astype(str).str.contains("user", case=False, na=False)
     total_consults = int(consult_mask.sum())
     fallback_count = int(log_df["event_type"].eq("fallback").sum())
     error_count = int(log_df["event_type"].eq("error").sum())
@@ -1223,7 +1262,7 @@ def render_common_upload_bar(current_db_df: pd.DataFrame, log_df: pd.DataFrame):
     with up1:
         current_db_file = st.file_uploader("현재 미야언니 DB 업로드", type=["csv", "xlsx"], key="current_db_top")
     with up2:
-        log_file = st.file_uploader("미야언니 V2 로그 업로드", type=["csv", "xlsx", "json", "jsonl"], key="log_file_top")
+        log_file = st.file_uploader("미야언니 V2 로그 업로드", type=["csv", "xlsx", "json", "jsonl", "log"], key="log_file_top")
 
     folder_cols = st.columns([1.5, 1])
     with folder_cols[0]:
@@ -1252,6 +1291,8 @@ def render_common_upload_bar(current_db_df: pd.DataFrame, log_df: pd.DataFrame):
 def render_dashboard(db_df: pd.DataFrame, log_df: pd.DataFrame):
     st.subheader("메인 대시보드")
     st.caption("총 상담 수, 일별 상담 수, fallback/error, 평균 응답속도를 한눈에 보는 화면입니다.")
+    if log_df is None or log_df.empty:
+        st.info("상단의 '데이터 불러오기'에서 미야언니 V2 로그 파일(.jsonl 또는 .log)을 업로드하거나, logs 폴더 읽기를 켜주세요.")
 
     log_df = merge_db_names(log_df, db_df)
     metrics = compute_overall_metrics(log_df)
@@ -1378,7 +1419,15 @@ def render_log_view(log_df: pd.DataFrame):
 
     filtered = filter_log_df(log_df, date_range=date_range, event_types=selected_events)
     st.markdown(f"##### 전체 로그 테이블 ({len(filtered):,}건)")
-    st.dataframe(filtered, use_container_width=True, hide_index=True, height=520)
+
+    # 표시 컬럼 선택
+    display_cols = [c for c in [
+        "timestamp", "event_type", "session_id", "product_no", "product_name",
+        "user_text", "bot_text", "response_mode", "fallback_reason",
+        "is_fallback", "latency_ms", "error_text"
+    ] if c in filtered.columns]
+    st.dataframe(filtered[display_cols], use_container_width=True, hide_index=True, height=520)
+
     st.download_button(
         "필터 결과 CSV 다운로드",
         data=filtered.to_csv(index=False).encode("utf-8-sig"),
@@ -1387,6 +1436,45 @@ def render_log_view(log_df: pd.DataFrame):
         use_container_width=True,
         key="filtered_logs_download",
     )
+
+    # ── 세션별 대화 상세 보기
+    st.markdown("##### 세션별 대화 상세 보기")
+    if "session_id" in filtered.columns:
+        session_list = [s for s in filtered["session_id"].dropna().unique().tolist() if s and s != "nan"]
+        if session_list:
+            selected_sess = st.selectbox("세션 선택", options=["전체"] + session_list[:50], key="sess_select")
+            if selected_sess != "전체":
+                sess_df = filtered[filtered["session_id"] == selected_sess].sort_values("timestamp")
+                for _, row in sess_df.iterrows():
+                    evt = str(row.get("event_type", ""))
+                    ts = str(row.get("timestamp", ""))[:19]
+                    pname = str(row.get("product_name", "") or row.get("product_no", ""))
+                    if "user" in evt:
+                        st.markdown(
+                            f'<div style="text-align:right;margin:4px 0;">'
+                            f'<span style="font-size:11px;color:#888;">{ts} | {pname}</span><br>'
+                            f'<span style="background:#dff0ec;padding:6px 12px;border-radius:12px;display:inline-block;">'
+                            f'{html.escape(str(row.get("user_text",""))[:200])}</span></div>',
+                            unsafe_allow_html=True
+                        )
+                    elif "assistant" in evt or "response" in evt:
+                        mode = str(row.get("response_mode", ""))
+                        latency = row.get("latency_ms", "")
+                        latency_str = f" | {latency:.0f}ms" if pd.notna(latency) and latency else ""
+                        fb_badge = " 🔄fallback" if row.get("is_fallback") else ""
+                        st.markdown(
+                            f'<div style="text-align:left;margin:4px 0;">'
+                            f'<span style="font-size:11px;color:#888;">{ts} | {mode}{latency_str}{fb_badge}</span><br>'
+                            f'<span style="background:#071b4e;color:#fff;padding:6px 12px;border-radius:12px;display:inline-block;">'
+                            f'{html.escape(str(row.get("bot_text",""))[:300])}</span></div>',
+                            unsafe_allow_html=True
+                        )
+                    elif "error" in evt:
+                        st.error(f"[{ts}] {row.get('error_text','')}")
+        else:
+            st.info("세션 ID가 있는 로그가 없어요. 미야언니 V2 최신 버전에서 생성된 로그인지 확인해주세요.")
+    else:
+        st.info("세션 ID 컬럼이 없어요.")
 
 def render_db_generation():
     st.subheader("자동 상품DB 생성")
