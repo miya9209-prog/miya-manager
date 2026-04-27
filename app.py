@@ -1183,24 +1183,47 @@ footer{visibility:hidden;}
 .rec-tail{margin-top:8px;line-height:1.55;}
 .label{font-size:12px;color:#666;margin:8px 0 3px;font-weight:700;}
 .stTextInput input, .stSelectbox div[data-baseweb="select"]{border-radius:12px;}
-/* 사이즈 입력칸은 좁은 팝업/모바일에서도 2×2 기본 구조 유지 */
+/* 사이즈 입력칸 2×2 고정: Streamlit 모바일 자동 1열 전환 강제 해제 */
+div[data-testid="stExpander"] div[data-testid="stHorizontalBlock"],
 div[data-testid="stHorizontalBlock"]{
-    display:flex !important;
-    flex-direction:row !important;
-    flex-wrap:nowrap !important;
-    gap:12px !important;
+    display:grid !important;
+    grid-template-columns:minmax(0,1fr) minmax(0,1fr) !important;
+    column-gap:12px !important;
+    row-gap:0 !important;
+    width:100% !important;
+    align-items:start !important;
+}
+div[data-testid="stExpander"] div[data-testid="stHorizontalBlock"] > div,
+div[data-testid="stHorizontalBlock"] > div,
+div[data-testid="stExpander"] div[data-testid="column"],
+div[data-testid="column"],
+.stColumn{
+    width:100% !important;
+    min-width:0 !important;
+    max-width:100% !important;
+    flex:initial !important;
+}
+div[data-testid="stExpander"] .stTextInput input,
+div[data-testid="stExpander"] .stSelectbox div[data-baseweb="select"]{
+    min-width:0 !important;
     width:100% !important;
 }
-div[data-testid="stHorizontalBlock"] > div,
-div[data-testid="stHorizontalBlock"] [data-testid="column"]{
-    flex:1 1 0 !important;
-    min-width:0 !important;
-    width:50% !important;
-}
-@media (max-width: 640px){
-    div[data-testid="stHorizontalBlock"]{flex-direction:row !important;flex-wrap:nowrap !important;gap:10px !important;}
+@media (max-width: 900px){
+    div[data-testid="stExpander"] div[data-testid="stHorizontalBlock"],
+    div[data-testid="stHorizontalBlock"]{
+        display:grid !important;
+        grid-template-columns:minmax(0,1fr) minmax(0,1fr) !important;
+        column-gap:10px !important;
+    }
+    div[data-testid="stExpander"] div[data-testid="stHorizontalBlock"] > div,
     div[data-testid="stHorizontalBlock"] > div,
-    div[data-testid="stHorizontalBlock"] [data-testid="column"]{flex:1 1 0 !important;min-width:0 !important;width:50% !important;}
+    div[data-testid="column"],
+    .stColumn{
+        width:100% !important;
+        min-width:0 !important;
+        max-width:100% !important;
+        flex:initial !important;
+    }
 }
 
 </style>
