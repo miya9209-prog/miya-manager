@@ -1,21 +1,33 @@
-# 미야언니 관리프로그램
+# 픽톡(PickTalk) 상담 챗봇 클린 배포본 - 고객DB 포함
 
-별도 운영용 Streamlit 앱입니다.
+백업 파일과 미사용 engine 폴더를 제거한 클린 운영 레포입니다.
+실제 고객 이름 호출용 customer_profiles.csv를 포함합니다.
 
-기능
-- 자동 상품DB 생성
-- 반자동 DB 업로드 준비
-- 미야언니 V2 통계 분석
-- DB 품질 점검 대시보드
+## 적용 방법
 
-## 실행
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+1. 기존 GitHub 레포 폴더를 백업합니다.
+2. 기존 레포 폴더 안 파일을 모두 삭제합니다.
+3. 이 zip 안의 pictalk-clean-release-with-customer-20260427 폴더 내부 파일 전체를 기존 레포에 복사합니다.
+4. GitHub Desktop에서 commit/push 합니다.
+5. Streamlit Cloud에서 재배포합니다.
 
-## 반영 흐름
-1. 자동 상품DB 생성에서 `misharp_miya_db.csv` 생성
-2. 반자동 DB 업로드 준비에서 현재 DB와 비교
-3. 다운로드한 `misharp_miya_db.csv`를 미야언니 V2 레포에 덮어쓰기
-4. GitHub 커밋 후 Streamlit 재배포
+## 포함 파일
+
+- app.py
+- misharp_miya_db.csv
+- review_summary.json
+- model_profiles.json
+- customer_profiles.csv
+- customer_profiles_template.csv
+- requirements.txt
+- logs/
+- docs/
+
+## 고객 이름 호출
+
+URL query로 customer_id, login_id, email 중 하나가 전달되면 customer_profiles.csv에서 이름을 매칭합니다.
+customer_name=홍길동을 직접 전달해도 됩니다.
+
+## 상담 로그
+
+상담 로그는 logs/pictalk_log_YYYY-MM.csv에 저장됩니다.

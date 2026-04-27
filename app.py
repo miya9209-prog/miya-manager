@@ -1,11 +1,11 @@
 import os
 import re
-import io
 import json
+import csv
 import time
-import html
-from datetime import datetime, date
-from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
+import datetime
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse, parse_qs
 
 import pandas as pd
 import requests
@@ -17,1602 +17,1260 @@ try:
 except Exception:
     OpenAI = None
 
-st.set_page_config(page_title="미야언니 관리프로그램", layout="wide")
+st.set_page_config(page_title="픽톡", layout="centered", initial_sidebar_state="collapsed")
 
-BASE_URL = "https://www.misharp.co.kr"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-BASE_COLUMNS = [
-    "product_no", "product_url", "product_name", "category", "sub_category", "price", "fabric",
-    "fit_type", "size_range", "recommended_body_type", "body_cover_features", "style_tags",
-    "season", "length_type", "sleeve_type", "color_options", "recommended_age",
-    "coordination_items", "product_summary"
+# =========================================================
+# 기본 설정
+# =========================================================
+APP_VERSION = "GPT-CENTERED-V2-20260427-UI-FITFIX"
+PRODUCT_DB_PATH = "misharp_miya_db.csv"
+REVIEW_SUMMARY_PATH = "review_summary.json"
+MODEL_PROFILES_PATH = "model_profiles.json"
+CUSTOMER_PROFILES_PATH = "customer_profiles.csv"
+
+SIZE_ORDER = {"44": 1, "55": 2, "55반": 3, "66": 4, "66반": 5, "77": 6, "77반": 7, "88": 8, "99": 9}
+BODY_CHEST_ESTIMATE = {"44":82, "55":88, "55반":90, "66":94, "66반":97, "77":100, "77반":103, "88":108, "99":114}
+
+TOP_WORDS = ["자켓", "재킷", "점퍼", "코트", "블라우스", "셔츠", "니트", "가디건", "맨투맨", "티셔츠", "후드", "조끼", "베스트"]
+BOTTOM_WORDS = ["팬츠", "슬랙스", "바지", "데님", "청바지", "스커트", "치마", "레깅스"]
+SHOE_WORDS = ["슈즈", "샌들", "힐", "로퍼", "부츠", "슬링백", "플랫", "스니커즈", "운동화", "신발"]
+BAG_WORDS = ["가방", "백", "토트", "크로스백", "숄더백", "클러치"]
+ACC_WORDS = ["머플러", "스카프"]
+COLOR_WORDS = ["블랙", "아이보리", "베이지", "그레이", "네이비", "화이트", "소라", "브라운", "카키", "핑크", "민트", "레드"]
+
+FORBIDDEN_PHRASES = [
+    "상품정보상", "DB 기준", "옵션중", "사이즈 범위 안에 들어와요", "흐름대로", "한 가지만 잡아주시면", "메뉴", "제가 방금 말을 매끄럽게"
 ]
-MEASUREMENT_COLUMNS = [
-    "shoulder", "chest", "chest_measure_type", "armhole", "sleeve", "sleeve_circumference",
-    "length", "length_front", "length_back", "measurement_source", "raw_measurements"
-]
-DB_COLUMNS = BASE_COLUMNS + MEASUREMENT_COLUMNS
-EXCLUDED_URL_KEYWORDS = [
-    "cate_no=", "/product/list", "/category/", "/board/", "/article/", "/member/",
-    "/order/", "/myshop/", "/exec/front/newcoupon", "/search/", "/product/recent_view_product",
-]
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 
-
-def get_client():
-    if OPENAI_API_KEY and OpenAI is not None:
-        return OpenAI(api_key=OPENAI_API_KEY)
-    return None
-
-
-def clean_text(text: str) -> str:
-    if text is None:
+# =========================================================
+# 유틸
+# =========================================================
+def clean_text(value) -> str:
+    if value is None:
         return ""
-    text = html.unescape(str(text))
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"<[^>]+>", " ", text)
+    text = str(value).replace("\xa0", " ").replace("\u200b", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
-
-def uniq_keep_order(items):
-    out, seen = [], set()
-    for item in items:
-        item = clean_text(item)
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
-def to_abs_url(url: str) -> str:
-    if not url:
-        return ""
-    return urljoin(BASE_URL, url)
-
-
-def extract_product_no(url: str) -> str:
-    if not url:
-        return ""
-    m = re.search(r"product_no=(\d+)", url)
-    if m:
-        return m.group(1)
-    m = re.search(r"/product/[^\s\"'>]+/(\d+)(?:/|\?|$)", url)
-    if m:
-        return m.group(1)
-    return ""
-
-
-def normalize_product_url(url: str) -> str:
-    pno = extract_product_no(url)
-    return f"{BASE_URL}/product/detail.html?product_no={pno}" if pno else to_abs_url(url)
-
-
-def is_product_url(url: str) -> bool:
-    url = (url or "").lower()
-    return bool(extract_product_no(url)) and "/product/list" not in url and "/category/" not in url
-
-
-def is_category_url(url: str) -> bool:
-    url = (url or "").lower()
-    return ((("/product/list.html" in url and "cate_no=" in url) or "/category/" in url) and not is_product_url(url))
-
-
-def build_page_url(category_url: str, page: int) -> str:
-    parsed = urlparse(category_url)
-    q = parse_qs(parsed.query)
-    q["page"] = [str(page)]
-    new_query = urlencode({k: v[0] for k, v in q.items()})
-    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-
-
-def fetch_html(url: str) -> str:
-    headers = {"User-Agent": USER_AGENT, "Referer": BASE_URL}
-    r = requests.get(url, headers=headers, timeout=25)
-    r.raise_for_status()
-    return r.text
-
-
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_html_cached(url: str) -> str:
-    return fetch_html(url)
-
-
-def extract_total_count(html_text: str):
-    t = clean_text(html_text)
-    m = re.search(r"TOTAL\s*[:：]?\s*(\d+)", t, flags=re.I)
-    return int(m.group(1)) if m else None
-
-
-def parse_product_cards_from_category_html(category_url: str, html_text: str):
-    soup = BeautifulSoup(html_text, "html.parser")
-    records = []
-    candidates = soup.select("li[id^='anchorBoxId_']")
-    if not candidates:
-        candidates = soup.select("ul.prdList > li, .xans-product-listnormal li, .prdList li")
-
-    for li in candidates:
-        li_html = str(li)
-        pno = ""
-        m = re.search(r"anchorBoxId_(\d+)", li.get("id", ""))
-        if m:
-            pno = m.group(1)
-
-        link = ""
-        for a in li.select("a[href]"):
-            href = to_abs_url(a.get("href", ""))
-            if not href:
-                continue
-            if any(bad in href.lower() for bad in EXCLUDED_URL_KEYWORDS):
-                continue
-            found_pno = extract_product_no(href)
-            if found_pno:
-                pno = pno or found_pno
-                link = normalize_product_url(href)
-                break
-
-        if not pno:
-            m = re.search(r"product_no=(\d+)", li_html)
-            if m:
-                pno = m.group(1)
-                link = f"{BASE_URL}/product/detail.html?product_no={pno}"
-
-        if not pno:
-            continue
-
-        text = clean_text(li.get_text(" ", strip=True))
-        name = ""
-        m = re.search(r"상품명\s*[:：]\s*(.*?)(?:상품 요약설명|판매가|할인판매가|$)", text)
-        if m:
-            name = clean_text(m.group(1))
-        if not name:
-            texts = [clean_text(a.get_text(" ", strip=True)) for a in li.select("a")]
-            texts = [x for x in texts if len(x) >= 4 and not re.fullmatch(r"자세히|장바구니 담기|관심상품 등록 전|할인기간|닫기", x)]
-            if texts:
-                name = max(texts, key=len)
-
-        price = ""
-        m = re.search(r"할인판매가\s*[:：]\s*([0-9,]+)원", text)
-        if m:
-            price = m.group(1).replace(",", "")
-        if not price:
-            m = re.search(r"판매가\s*[:：]\s*([0-9,]+)원", text)
-            if m:
-                price = m.group(1).replace(",", "")
-
-        summary = ""
-        m = re.search(r"상품 요약설명\s*[:：]\s*(.*?)(?:판매가|할인판매가|$)", text)
-        if m:
-            summary = clean_text(m.group(1))
-
-        records.append({
-            "product_no": pno,
-            "product_url": link or f"{BASE_URL}/product/detail.html?product_no={pno}",
-            "card_name": name,
-            "card_price": price,
-            "card_summary": summary,
-        })
-
-    cleaned = []
-    seen = set()
-    for r in records:
-        pno = clean_text(r.get("product_no"))
-        if not pno.isdigit():
-            continue
-        name = clean_text(r.get("card_name"))
-        if not name or name in {"전체상품", "이번주 신상"}:
-            continue
-        if pno in seen:
-            continue
-        seen.add(pno)
-        cleaned.append(r)
-    return cleaned
-
-
-def collect_product_cards_from_category(category_url: str, max_products: int = 500, delay_sec: float = 0.2):
-    first_html = fetch_html_cached(category_url)
-    total_count = extract_total_count(first_html)
-    all_cards = []
-    seen = set()
-    page = 1
-    empty_streak = 0
-    max_pages = 50
-
-    while page <= max_pages:
-        page_url = category_url if page == 1 else build_page_url(category_url, page)
-        try:
-            html_text = first_html if page == 1 else fetch_html(page_url)
-        except Exception:
-            break
-
-        cards = parse_product_cards_from_category_html(category_url, html_text)
-        newly_added = 0
-        for c in cards:
-            pno = c["product_no"]
-            if pno in seen:
-                continue
-            seen.add(pno)
-            all_cards.append(c)
-            newly_added += 1
-            if len(all_cards) >= max_products:
-                return all_cards, total_count
-
-        if newly_added == 0:
-            empty_streak += 1
-        else:
-            empty_streak = 0
-        if total_count and len(all_cards) >= total_count:
-            break
-        if empty_streak >= 2:
-            break
-
-        page += 1
-        if delay_sec > 0:
-            time.sleep(delay_sec)
-
-    return all_cards, total_count
-
+def normalize_product_no(value) -> str:
+    s = clean_text(value)
+    return s[:-2] if s.endswith(".0") else s
 
 def normalize_name(name: str) -> str:
-    name = clean_text(name)
-    name = re.sub(r"\s*\([^)]*color[^)]*\)", "", name, flags=re.I)
-    return clean_text(name)
-
-
-def infer_category_from_name(name: str):
-    name_l = (name or "").lower()
-    pairs = [
-        ("아우터", "자켓", ["자켓", "재킷", "jk"]),
-        ("아우터", "점퍼", ["점퍼", "후드", "사파리"]),
-        ("아우터", "코트", ["코트"]),
-        ("니트/가디건", "니트", ["니트"]),
-        ("니트/가디건", "가디건", ["가디건"]),
-        ("팬츠", "슬랙스", ["슬랙스"]),
-        ("팬츠", "데님", ["데님", "청바지", "진"]),
-        ("팬츠", "팬츠", ["팬츠", "바지"]),
-        ("블라우스/셔츠", "블라우스", ["블라우스"]),
-        ("블라우스/셔츠", "셔츠", ["셔츠"]),
-        ("티셔츠", "티셔츠", ["티셔츠", "맨투맨", "mtm"]),
-        ("원피스/스커트", "원피스", ["원피스"]),
-        ("원피스/스커트", "스커트", ["스커트"]),
-    ]
-    for cat, sub, kws in pairs:
-        if any(kw in name_l for kw in kws):
-            return cat, sub
-    return "", ""
-
-
-def infer_fabric(text: str) -> str:
-    t = clean_text(text)
-    patterns = [
-        r"(면\s*\d+%[^\n,.]*)", r"(코튼\s*\d+%[^\n,.]*)", r"(폴리(?:에스터)?\s*\d+%[^\n,.]*)",
-        r"(레이온\s*\d+%[^\n,.]*)", r"(울\s*\d+%[^\n,.]*)", r"(비스코스\s*\d+%[^\n,.]*)",
-        r"(나일론\s*\d+%[^\n,.]*)", r"(스판(?:덱스)?\s*\d+%[^\n,.]*)",
-    ]
-    found = []
-    for p in patterns:
-        for m in re.findall(p, t, flags=re.I):
-            cm = clean_text(m)
-            if cm not in found:
-                found.append(cm)
-    return " / ".join(found[:4]) if found else ""
-
-
-def infer_fit_type(text: str) -> str:
-    t = clean_text(text)
-    rules = [
-        ("오버핏", ["오버핏"]),
-        ("루즈핏", ["루즈핏"]),
-        ("세미루즈", ["세미루즈", "여유 있는 핏", "살짝 여유"]),
-        ("슬림핏", ["슬림핏"]),
-        ("정핏", ["정핏", "단정한 핏", "기본 핏"]),
-        ("A라인", ["A라인", "A LINE"]),
-    ]
-    for val, keys in rules:
-        if any(k in t for k in keys):
-            return val
-    return ""
-
-
-def infer_style_tags(text: str, name: str) -> str:
-    t = f"{name} {text}"
-    rules = [
-        ("클래식", ["클래식", "단정", "라운드 자켓"]),
-        ("페미닌", ["페미닌", "여성스러운", "플라워", "트위드"]),
-        ("데일리", ["데일리", "기본", "편하게"]),
-        ("오피스룩", ["오피스", "출근룩", "직장인"]),
-        ("학모룩", ["학부모", "학교", "상담룩"]),
-        ("모임룩", ["모임룩", "하객룩"]),
-    ]
-    out = [tag for tag, keys in rules if any(k in t for k in keys)]
-    return ";".join(out[:4])
-
-
-def infer_season(text: str, name: str) -> str:
-    t = f"{name} {text}"
-    out = []
-    for tag, keys in [
-        ("봄", ["봄", "간절기"]),
-        ("여름", ["여름", "반팔", "린넨"]),
-        ("가을", ["가을", "간절기"]),
-        ("겨울", ["겨울", "울", "기모"]),
-        ("간절기", ["간절기"]),
-    ]:
-        if any(k in t for k in keys) and tag not in out:
-            out.append(tag)
-    return ";".join(out[:3])
-
-
-def infer_length_type(name: str, text: str) -> str:
-    t = f"{name} {text}"
-    if "크롭" in t:
-        return "크롭"
-    if "롱" in t:
-        return "롱"
-    if "하프" in t:
-        return "하프"
-    return "기본"
-
-
-def infer_sleeve_type(name: str, text: str) -> str:
-    t = f"{name} {text}"
-    if "반팔" in t:
-        return "반팔"
-    if "퍼프" in t:
-        return "퍼프소매"
-    if "드롭숄더" in t:
-        return "드롭숄더"
-    return "긴팔"
-
-
-def infer_color_options(text: str, name: str) -> str:
-    t = f"{name} {text}"
-    colors = [c for c in ["블랙", "화이트", "아이보리", "베이지", "그레이", "핑크", "네이비", "브라운", "카키", "소라"] if c in t]
-    m = re.search(r"\((\d+)\s*color\)", name, flags=re.I)
-    if not colors and m:
-        return f"{m.group(1)}컬러"
-    return ";".join(colors[:6]) if colors else ""
-
-
-def infer_body_cover(text: str, name: str) -> str:
-    t = f"{name} {text}"
-    rules = [
-        ("팔뚝커버", ["팔뚝", "퍼프", "레글런"]),
-        ("뱃살커버", ["복부", "배라인", "군살"]),
-        ("힙커버", ["힙", "롱기장", "하프"]),
-        ("허리라인보정", ["허리선", "라인", "A라인"]),
-    ]
-    out = [tag for tag, keys in rules if any(k in t for k in keys)]
-    return ";".join(out[:4])
-
-
-def infer_recommended_body_type(name: str, text: str) -> str:
-    t = f"{name} {text}"
-    out = []
-    if any(k in t for k in ["어깨", "레글런"]):
-        out.append("어깨좁음")
-    if any(k in t for k in ["팔뚝", "퍼프"]):
-        out.append("팔뚝통통")
-    if any(k in t for k in ["복부", "배라인", "허리"]):
-        out.append("복부체형")
-    if any(k in t for k in ["와이드", "A라인", "힙"]):
-        out.append("하체통통")
-    if not out:
-        out.append("4050 여성 일반체형")
-    return ";".join(out[:3])
-
-
-def infer_coordination_items(name: str, text: str) -> str:
-    t = f"{name} {text}"
-    out = []
-    for item in ["슬랙스", "데님", "스커트", "원피스", "니트"]:
-        if item in t:
-            out.append(item)
-    return ";".join(out[:4]) if out else "슬랙스;데님;스커트"
-
-
-def extract_detail_text_blocks(soup: BeautifulSoup) -> str:
-    blocks = []
-    selectors = [
-        "meta[property='og:title']",
-        ".headingArea h2", ".headingArea h3", ".headingArea .name",
-        ".infoArea", ".xans-product-detaildesign", ".prdInfo", ".detailArea",
-        "#prdDetail", ".cont", ".ec-base-table", ".xans-product-additional"
-    ]
-    for sel in selectors:
-        for node in soup.select(sel):
-            if node.name == "meta":
-                txt = clean_text(node.get("content", ""))
-            else:
-                txt = clean_text(node.get_text(" ", strip=True))
-            if txt:
-                blocks.append(txt)
-    return "\n".join(uniq_keep_order(blocks))[:20000]
-
-
-def extract_size_context(soup: BeautifulSoup, full_text: str) -> str:
-    blocks = []
-    for sel in [".infoArea", ".xans-product-detaildesign", ".detailArea", "#prdDetail", ".ec-base-table", "table"]:
-        for node in soup.select(sel):
-            txt = clean_text(node.get_text(" ", strip=True))
-            if any(k.lower() in txt.lower() for k in ["사이즈", "추천", "free", "프리", "55", "66", "77", "88", "xl", "l(", "xl("]):
-                blocks.append(txt)
-    if not blocks:
-        blocks.append(full_text)
-    return " ".join(uniq_keep_order(blocks))[:12000]
-
-
-def infer_size_range(text: str):
-    t = clean_text(text)
-    if not t:
-        return "", ""
-
-    ranges = re.findall(r"(44|55반|55|66반|66|77반|77|88|99)\s*[-~]\s*(44|55반|55|66반|66|77반|77|88|99)", t)
-    if ranges:
-        order = {"44": 1, "55": 2, "55반": 3, "66": 4, "66반": 5, "77": 6, "77반": 7, "88": 8, "99": 9}
-        mins = sorted(ranges, key=lambda x: order.get(x[0], 999))[0][0]
-        maxs = sorted(ranges, key=lambda x: order.get(x[1], -1))[-1][1]
-        return f"{mins}-{maxs}", "option_range"
-
-    m = re.search(r"(44|55반|55|66반|66|77반|77|88|99)\s*까지\s*(?:추천|착용|가능)?", t)
-    if m:
-        return f"55-{m.group(1)}", "recommend_text"
-
-    singles = re.findall(r"(?<!\d)(44|55반|55|66반|66|77반|77|88|99)(?!\d)", t)
-    if len(singles) >= 2:
-        uniq = []
-        for s in singles:
-            if s not in uniq:
-                uniq.append(s)
-        return f"{uniq[0]}-{uniq[-1]}", "size_tokens"
-
-    if re.search(r"\bFREE\b|프리사이즈|FREE사이즈|F사이즈|\bF\b", t, re.I):
-        return "55-66", "free_default"
-
-    return "", ""
-
-
-def _extract_number(text: str) -> str:
-    m = re.search(r"(-?\d+(?:\.\d+)?)", clean_text(text))
-    return m.group(1) if m else ""
-
-
-def _normalize_measure_header(header: str) -> str:
-    h = clean_text(header).replace(" ", "")
-    if not h:
-        return ""
-    if "어깨" in h:
-        return "shoulder"
-    if "가슴" in h and "둘레" in h:
-        return "chest_circumference"
-    if "가슴" in h:
-        return "chest"
-    if "암홀" in h:
-        return "armhole"
-    if "소매" in h and "둘레" in h:
-        return "sleeve_circumference"
-    if "소매" in h:
-        return "sleeve"
-    if ("총장" in h or "기장" in h) and "앞" in h:
-        return "length_front"
-    if ("총장" in h or "기장" in h) and "뒤" in h:
-        return "length_back"
-    if "총장" in h or "기장" in h:
-        return "length"
-    return ""
-
-
-def _measurement_payload():
-    return {
-        "shoulder": "", "chest": "", "chest_measure_type": "", "armhole": "", "sleeve": "",
-        "sleeve_circumference": "", "length": "", "length_front": "", "length_back": "",
-        "measurement_source": "", "raw_measurements": "",
-    }
-
-
-def _apply_measure_value(payload: dict, key: str, raw_value: str):
-    value = _extract_number(raw_value)
-    if not value:
-        return
-    if key == "chest_circumference":
-        payload["chest_measure_type"] = "circumference"
-        try:
-            f = float(value)
-            payload["chest"] = str(int(f / 2)) if float(f / 2).is_integer() else f"{f/2:.1f}"
-        except Exception:
-            payload["chest"] = value
-        return
-    payload[key] = value
-
-
-def parse_measurement_tables(soup: BeautifulSoup) -> dict:
-    payload = _measurement_payload()
-    raw_pairs = []
-    found = False
-
-    for table in soup.select("table"):
-        rows = []
-        for tr in table.select("tr"):
-            cells = [clean_text(c.get_text(" ", strip=True)) for c in tr.select("th,td")]
-            cells = [c for c in cells if c]
-            if cells:
-                rows.append(cells)
-        if not rows:
-            continue
-
-        flat = " ".join([" ".join(r) for r in rows])
-        if not any(k in flat for k in ["어깨", "가슴", "암홀", "소매", "총장", "기장"]):
-            continue
-
-        if len(rows) >= 2:
-            headers = rows[0]
-            values = rows[1]
-            if len(headers) == len(values) and len(headers) >= 2:
-                local_hits = 0
-                for h, v in zip(headers, values):
-                    key = _normalize_measure_header(h)
-                    if key:
-                        _apply_measure_value(payload, key, v)
-                        raw_pairs.append({clean_text(h): _extract_number(v)})
-                        local_hits += 1
-                if local_hits >= 2:
-                    found = True
-
-        for row in rows:
-            if len(row) >= 2:
-                key = _normalize_measure_header(row[0])
-                if key:
-                    _apply_measure_value(payload, key, row[1])
-                    raw_pairs.append({clean_text(row[0]): _extract_number(row[1])})
-                    found = True
-
-    if payload["length"] == "":
-        vals = [v for v in [payload["length_front"], payload["length_back"]] if v]
-        if vals:
-            try:
-                payload["length"] = str(max(float(v) for v in vals)).rstrip('0').rstrip('.')
-            except Exception:
-                payload["length"] = vals[-1]
-
-    if found:
-        payload["measurement_source"] = "table"
-        payload["raw_measurements"] = json.dumps(raw_pairs, ensure_ascii=False)
-    return payload
-
-
-def parse_measurements_from_text(full_text: str) -> dict:
-    payload = _measurement_payload()
-    patterns = {
-        "shoulder": [r"어깨단면", r"어깨"],
-        "chest": [r"가슴단면", r"가슴"],
-        "armhole": [r"암홀둘레", r"암홀"],
-        "sleeve": [r"소매길이", r"소매장", r"소매"],
-        "sleeve_circumference": [r"소매둘레"],
-        "length_front": [r"총장\(앞\)", r"앞총장"],
-        "length_back": [r"총장\(뒤\)", r"뒤총장"],
-        "length": [r"총장", r"기장"],
-    }
-    raw_pairs = []
-    for field, keys in patterns.items():
-        for key in keys:
-            m = re.search(rf"(?:{key})\s*[:：]?\s*(-?\d+(?:\.\d+)?)", full_text)
-            if m:
-                payload[field] = m.group(1)
-                raw_pairs.append({key: m.group(1)})
-                break
-
-    m = re.search(r"가슴둘레\s*[:：]?\s*(-?\d+(?:\.\d+)?)", full_text)
-    if m and not payload["chest"]:
-        raw_val = m.group(1)
-        payload["chest_measure_type"] = "circumference"
-        try:
-            f = float(raw_val)
-            payload["chest"] = str(int(f / 2)) if float(f / 2).is_integer() else f"{f/2:.1f}"
-        except Exception:
-            payload["chest"] = raw_val
-        raw_pairs.append({"가슴둘레": raw_val})
-
-    if payload["length"] == "":
-        vals = [v for v in [payload["length_front"], payload["length_back"]] if v]
-        if vals:
-            try:
-                payload["length"] = str(max(float(v) for v in vals)).rstrip('0').rstrip('.')
-            except Exception:
-                payload["length"] = vals[-1]
-
-    if any(payload[k] for k in ["shoulder", "chest", "armhole", "sleeve", "sleeve_circumference", "length", "length_front", "length_back"]):
-        payload["measurement_source"] = "text"
-        payload["raw_measurements"] = json.dumps(raw_pairs, ensure_ascii=False)
-    return payload
-
-
-def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "", fallback_summary: str = "") -> dict:
-    html_text = fetch_html_cached(url)
-    soup = BeautifulSoup(html_text, "html.parser")
-    full_text = extract_detail_text_blocks(soup)
-
-    name = fallback_name
-    for sel in [".headingArea h2", ".headingArea h3", ".headingArea .name"]:
-        node = soup.select_one(sel)
-        if node and clean_text(node.get_text(" ", strip=True)):
-            name = clean_text(node.get_text(" ", strip=True))
-            break
-    if not name:
-        meta = soup.select_one("meta[property='og:title']")
-        if meta:
-            name = clean_text(meta.get("content", ""))
-    name = normalize_name(name)
-
-    price = fallback_price
-    if not price:
-        text = clean_text(full_text)
-        m = re.search(r"할인판매가\s*[:：]?\s*([0-9,]+)원", text)
-        if m:
-            price = m.group(1).replace(",", "")
-        else:
-            m = re.search(r"판매가\s*[:：]?\s*([0-9,]+)원", text)
-            if m:
-                price = m.group(1).replace(",", "")
-
-    category, sub_category = infer_category_from_name(name)
-    fabric = infer_fabric(full_text)
-    size_range, size_source = infer_size_range(extract_size_context(soup, full_text))
-    fit_type = infer_fit_type(full_text)
-    recommended_body_type = infer_recommended_body_type(name, full_text)
-    body_cover_features = infer_body_cover(full_text, name)
-    style_tags = infer_style_tags(full_text, name)
-    season = infer_season(full_text, name)
-    length_type = infer_length_type(name, full_text)
-    sleeve_type = infer_sleeve_type(name, full_text)
-    color_options = infer_color_options(full_text, name)
-    coordination_items = infer_coordination_items(name, full_text)
-
-    measurements = parse_measurement_tables(soup)
-    if not measurements.get("measurement_source"):
-        measurements = parse_measurements_from_text(full_text)
-
-    summary_src = fallback_summary or full_text
-    summary_clean = clean_text(summary_src)
-    summary_clean = re.sub(r"^.*?상품 요약설명\s*[:：]?", "", summary_clean)
-    summary_clean = re.sub(r"(최근 본 상품|전체상품목록 바로가기|본문 바로가기|LOGIN|JOIN|MYPAGE|CART|ABOUT|SHOP).*$", "", summary_clean)
-    product_summary = clean_text(summary_clean)[:220] or clean_text(name)[:220]
-
-    return {
-        "product_no": extract_product_no(url),
-        "product_url": normalize_product_url(url),
-        "product_name": name,
-        "category": category,
-        "sub_category": sub_category,
-        "price": price,
-        "fabric": fabric,
-        "fit_type": fit_type,
-        "size_range": size_range or "",
-        "recommended_body_type": recommended_body_type,
-        "body_cover_features": body_cover_features,
-        "style_tags": style_tags,
-        "season": season,
-        "length_type": length_type,
-        "sleeve_type": sleeve_type,
-        "color_options": color_options,
-        "recommended_age": "4050",
-        "coordination_items": coordination_items,
-        "product_summary": product_summary,
-        **measurements,
-        "_size_source": size_source,
-    }
-
-
-def normalize_with_openai(row: dict) -> dict:
-    client = get_client()
-    if client is None:
-        return row
-    normalize_cols = BASE_COLUMNS
-    prompt = f"""
-다음 미샵 상품 정보를 미야언니 DB 형식으로 표준화하세요.
-반드시 아래 키만 JSON으로 반환하세요.
-키 순서:
-{normalize_cols}
-규칙:
-- 출력은 한국어
-- style_tags, body_cover_features, coordination_items, season은 세미콜론(;)으로 구분
-- product_summary는 120자 내외
-- 빈 값은 추론하되 과장 금지
-- 제공된 product_no, product_url, product_name, price는 바꾸지 말 것
-입력 데이터:
-{json.dumps({k: row.get(k, '') for k in DB_COLUMNS}, ensure_ascii=False)}
-"""
+    s = clean_text(name)
+    s = re.sub(r"\([^)]*color[^)]*\)", " ", s, flags=re.I)
+    s = re.sub(r"\[[^\]]*\]", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip(" -|/")
+
+def extract_product_no_from_url(url: str) -> str:
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": "너는 패션 상품 DB 정규화 전문가다."},
-                {"role": "user", "content": prompt},
-            ],
-        )
-        text = resp.choices[0].message.content.strip()
-        m = re.search(r"\{.*\}", text, re.S)
-        if not m:
-            return row
-        data = json.loads(m.group(0))
-        out = row.copy()
-        for col in normalize_cols:
-            out[col] = clean_text(data.get(col, row.get(col, "")))
-        return out
+        qs = parse_qs(urlparse(url).query)
+        return normalize_product_no(qs.get("product_no", [""])[0] or qs.get("pn", [""])[0])
     except Exception:
-        return row
+        return ""
 
+def query_params() -> Dict[str, str]:
+    try:
+        qp = st.query_params
+        return {k: clean_text(v[0] if isinstance(v, list) else v) for k, v in qp.items()}
+    except Exception:
+        return {}
 
-def build_dataframe(rows):
-    normalized = []
-    for r in rows:
-        item = {col: clean_text(r.get(col, "")) for col in DB_COLUMNS}
-        normalized.append(item)
-    df = pd.DataFrame(normalized, columns=DB_COLUMNS)
-    if not df.empty:
-        df = df.drop_duplicates(subset=["product_no"], keep="first")
-        df = df[df["product_no"].astype(str).str.fullmatch(r"\d+")]
-        df = df[df["product_name"].astype(str).str.len() >= 2]
-    return df.reset_index(drop=True)
+def size_rank(s: str) -> Optional[int]:
+    return SIZE_ORDER.get(clean_text(s))
 
+def detect_category(text: str) -> str:
+    c = clean_text(text)
+    if any(w in c for w in SHOE_WORDS): return "신발"
+    if any(w in c for w in BAG_WORDS): return "가방"
+    if any(w in c for w in ACC_WORDS): return "악세사리"
+    if any(w in c for w in ["블라우스", "블라우스/셔츠"]): return "블라우스"
+    if "셔츠" in c and "셔츠 자켓" not in c: return "셔츠"
+    if "맨투맨" in c: return "맨투맨"
+    if "티셔츠" in c or "티" in c: return "티셔츠"
+    if "가디건" in c: return "가디건"
+    if "니트" in c: return "니트"
+    if any(w in c for w in ["자켓", "재킷", "점퍼", "코트", "조끼", "베스트", "아우터", "후드", "야상"]): return "자켓"
+    if any(w in c for w in ["팬츠", "슬랙스", "바지", "데님", "청바지"]): return "팬츠"
+    if any(w in c for w in ["스커트", "치마"]): return "스커트"
+    return "기타"
 
-def analyze_urls(input_text: str, use_openai: bool, delay_sec: float, max_products: int):
-    urls = [clean_text(x) for x in re.split(r"[\n,]", input_text) if clean_text(x)]
-    if not urls:
-        return pd.DataFrame(columns=DB_COLUMNS), []
+def tokens(text: str) -> List[str]:
+    text = re.sub(r"[\[\]()/_\-,.|]+", " ", clean_text(text))
+    stop = {"이", "그", "저", "상품", "옷", "비교", "추천", "해줘", "해주세요", "고민", "비슷", "다른", "더", "좋은", "랑", "이랑", "와", "과"}
+    return [t for t in text.split() if len(t) >= 2 and t not in stop]
 
-    audit = []
-    rows = []
-    product_targets = []
+def name_score(query: str, name: str) -> float:
+    qts, nts = tokens(query), tokens(name)
+    if not qts or not nts: return 0
+    score = 0
+    ntext = clean_text(name)
+    qtext = clean_text(query)
+    if qtext and qtext in ntext: score += 8
+    for qt in qts:
+        for nt in nts:
+            if qt == nt: score += 4
+            elif qt in nt or nt in qt: score += 1.5
+    return score
 
-    for url in urls:
-        if is_category_url(url):
-            cards, total_count = collect_product_cards_from_category(url, max_products=max_products, delay_sec=delay_sec)
-            product_targets.extend(cards)
-            audit.append({"input_url": url, "type": "category", "detected_total": total_count or "", "collected_products": len(cards)})
-        elif is_product_url(url):
-            purl = normalize_product_url(url)
-            product_targets.append({"product_no": extract_product_no(purl), "product_url": purl, "card_name": "", "card_price": "", "card_summary": ""})
-            audit.append({"input_url": url, "type": "product", "detected_total": "", "collected_products": 1})
+def safe_postprocess(answer: str, customer_call: str) -> str:
+    ans = clean_text(answer)
+    for phrase in FORBIDDEN_PHRASES:
+        ans = ans.replace(phrase, "")
+    ans = ans.replace("고객님", customer_call)
+    ans = re.sub(r"(\S+)은\s", lambda m: (m.group(1) + "은 ") if not m.group(1).endswith(("스", "츠", "스커트", "팬츠", "슬랙스")) else (m.group(1) + "는 "), ans)
+    # Remove duplicate sentences roughly
+    parts = re.split(r"(?<=[.!?요])\s+", ans)
+    seen, out = set(), []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            out.append(p); seen.add(p)
+    return " ".join(out).strip()
 
-    dedup_targets = []
-    seen = set()
-    for t in product_targets:
-        pno = clean_text(t.get("product_no"))
-        if not pno or pno in seen:
-            continue
-        seen.add(pno)
-        dedup_targets.append(t)
+# =========================================================
+# 데이터 로드
+# =========================================================
+@st.cache_data(show_spinner=False)
+def load_product_db() -> List[Dict]:
+    if not os.path.exists(PRODUCT_DB_PATH):
+        return []
+    df = pd.read_csv(PRODUCT_DB_PATH)
+    df.columns = [clean_text(c) for c in df.columns]
+    for c in df.columns:
+        df[c] = df[c].fillna("").astype(str).map(clean_text)
+    if "product_no" in df.columns:
+        df["product_no"] = df["product_no"].map(normalize_product_no)
+    return df.to_dict("records")
 
-    prog = st.progress(0)
-    status = st.empty()
-    total = len(dedup_targets)
+@st.cache_data(show_spinner=False)
+def load_json(path: str):
+    if not os.path.exists(path): return {} if path.endswith(".json") else []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-    for i, t in enumerate(dedup_targets, start=1):
-        status.info(f"{i}/{total} 처리 중: {t.get('product_no')} {t.get('card_name','')[:40]}")
+@st.cache_data(show_spinner=False)
+def load_customer_profiles() -> List[Dict]:
+    if not os.path.exists(CUSTOMER_PROFILES_PATH):
+        return []
+    try:
+        df = pd.read_csv(CUSTOMER_PROFILES_PATH)
+        df.columns = [clean_text(c) for c in df.columns]
+        for c in df.columns:
+            df[c] = df[c].fillna("").astype(str).map(clean_text)
+        return df.to_dict("records")
+    except Exception:
+        return []
+
+DB_ROWS = load_product_db()
+REVIEW_SUMMARY = load_json(REVIEW_SUMMARY_PATH)
+MODEL_PROFILES = load_json(MODEL_PROFILES_PATH)
+CUSTOMER_PROFILES = load_customer_profiles()
+
+# =========================================================
+# 상태
+# =========================================================
+def ensure_state():
+    defaults = {
+        "messages": [],
+        "last_context_key": "",
+        "body_height": "",
+        "body_weight": "",
+        "body_top": "",
+        "body_bottom": "",
+        "shoe_size": "",
+        "last_recommendations": [],
+        "selected_product": {},
+        "conversation_focus": "",
+        "situation_context": "",
+        "last_user_intent": "",
+        "last_error": "",
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+ensure_state()
+
+def body_context() -> Dict:
+    return {
+        "height_cm": clean_text(st.session_state.body_height),
+        "weight_kg": clean_text(st.session_state.body_weight),
+        "top_size": clean_text(st.session_state.body_top),
+        "bottom_size": clean_text(st.session_state.body_bottom),
+        "shoe_size": clean_text(st.session_state.shoe_size),
+    }
+
+def body_summary() -> str:
+    b = body_context()
+    return f"키: {b['height_cm'] or '-'}cm, 체중: {b['weight_kg'] or '-'}kg, 상의: {b['top_size'] or '-'}, 하의: {b['bottom_size'] or '-'}, 신발: {b['shoe_size'] or '-'}"
+
+# =========================================================
+# 고객명
+# =========================================================
+def resolve_customer_name() -> str:
+    qp = query_params()
+    for direct_key in ["customer_name", "name", "member_name", "user_name", "nickname", "nick"]:
+        if qp.get(direct_key):
+            return qp[direct_key]
+    for key in ["customer_id", "login_id", "email", "member_id", "user_id"]:
+        val = qp.get(key, "")
+        if not val: continue
+        for row in CUSTOMER_PROFILES:
+            if clean_text(row.get(key, "")) == val and clean_text(row.get("name", "")):
+                return clean_text(row.get("name", ""))
+    return ""
+
+def customer_call() -> str:
+    name = resolve_customer_name()
+    return f"{name}님" if name else "고객님"
+
+# =========================================================
+# 현재 상품 컨텍스트
+# =========================================================
+def get_db_product(product_no: str) -> Optional[Dict]:
+    pno = normalize_product_no(product_no)
+    if not pno: return None
+    for row in DB_ROWS:
+        if normalize_product_no(row.get("product_no", "")) == pno:
+            return row
+    return None
+
+def get_db_product_by_name(name: str) -> Optional[Dict]:
+    scored = []
+    for row in DB_ROWS:
+        sc = name_score(name, row.get("product_name", ""))
+        if sc > 0: scored.append((sc, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1] if scored else None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_product_context(url: str, product_no: str = "", product_name: str = "") -> Dict:
+    pno = normalize_product_no(product_no) or extract_product_no_from_url(url)
+    db = get_db_product(pno)
+    if db:
+        name = normalize_name(db.get("product_name", ""))
+        return {
+            "product_no": pno,
+            "product_name": name or normalize_name(product_name) or "지금 보시는 상품",
+            "category": detect_category(f"{db.get('product_name','')} {db.get('category','')} {db.get('sub_category','')}"),
+            "summary": clean_text(db.get("product_summary", "")),
+            "fit": clean_text(db.get("fit_type", "")),
+            "size_range": clean_text(db.get("size_range", "")),
+            "colors": clean_text(db.get("color_options", "")),
+            "db": db,
+            "crawl_text": "",
+        }
+    name = normalize_name(product_name)
+    crawl_text = ""
+    if url:
         try:
-            row = parse_detail_page(t["product_url"], fallback_name=t.get("card_name", ""), fallback_price=t.get("card_price", ""), fallback_summary=t.get("card_summary", ""))
-            if use_openai:
-                row = normalize_with_openai(row)
-            rows.append(row)
-        except Exception as e:
-            audit.append({"input_url": t.get("product_url", ""), "type": "detail_error", "detected_total": "", "collected_products": str(e)})
-        prog.progress(i / max(total, 1))
-        if delay_sec > 0:
-            time.sleep(delay_sec)
+            r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+            soup = BeautifulSoup(r.text, "html.parser")
+            og = soup.select_one('meta[property="og:title"]')
+            if not name and og and og.get("content"):
+                name = normalize_name(og.get("content"))
+            for t in soup(["script", "style", "noscript"]): t.decompose()
+            crawl_text = clean_text(soup.get_text(" "))[:2500]
+        except Exception:
+            pass
+    return {"product_no": pno, "product_name": name or "지금 보시는 상품", "category": detect_category(name + " " + crawl_text), "summary":"", "fit":"", "size_range":"", "colors":"", "db": None, "crawl_text": crawl_text}
 
-    status.success(f"완료: {len(rows)}개 상품 DB 생성")
-    df = build_dataframe(rows)
-    return df, audit
+# =========================================================
+# 의도 분석: GPT 중심이지만 라우터는 상담축만 결정
+# =========================================================
+def detect_intent(user_text: str) -> str:
+    q = clean_text(user_text)
+    no_space = q.replace(" ", "")
+    if no_space in {"응", "네", "넵", "좋아", "그래", "ㅇㅇ", "어"}:
+        return "affirm"
+    if re.search(r"[123]번|첫 ?번째|두 ?번째|세 ?번째", q):
+        return "followup_selected"
+    if any(k in q for k in ["일자", "부츠컷", "숏", "롱", "타입", "기본형", "와이드형"]):
+        return "option_choice"
+    if any(k in q for k in ["장점", "특징", "왜 좋아", "뭐가 좋아", "좋은 점"]):
+        return "feature"
+    if any(k in q for k in ["비교", "둘 중", "뭐가 더", "어느 게", "어느게"]):
+        return "compare"
+    if any(k in q for k in ["컬러", "색상", "무슨 색", "어떤 색", "블랙", "아이보리", "베이지", "브라운"]):
+        return "color"
+
+    explicit_cat = explicit_target_category_from_text(q)
+    # 사용자가 특정 카테고리 + 추천/코디/어울림을 말하면, 현재 상품이 무엇이든 코디추천으로 처리
+    if explicit_cat and any(k in q for k in ["추천", "코디", "어울", "같이", "입을", "매치"]):
+        return "coordi_recommend"
+
+    if any(k in q for k in ["어울리는", "같이 입", "코디", "안에 입", "신발", "가방", "머플러"]):
+        return "coordi_recommend"
+    if any(k in q for k in ["대체", "말고"]):
+        if explicit_target_category_from_text(q):
+            return "coordi_recommend"
+        return "alternative_recommend"
+    if any(k in q for k in ["비슷", "다른", "대신", "더 좋은", "더 나은", "추천"]):
+        return "alternative_recommend"
+    if any(k in q for k in ["배송", "교환", "반품", "환불", "출고"]):
+        return "policy"
+    if any(k in q for k in ["힙", "허벅지", "골반", "복부", "상체", "가슴", "다리", "짧", "키", "맞", "사이즈", "핏", "작", "클", "여유", "타이트"]):
+        return "fit_size"
+    return "general"
 
 
-def ensure_db_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=DB_COLUMNS)
-    out = df.copy()
-    out.columns = [clean_text(c) for c in out.columns]
-    for col in DB_COLUMNS:
-        if col not in out.columns:
-            out[col] = ""
-    out = out[DB_COLUMNS].copy()
-    for col in out.columns:
-        out[col] = out[col].fillna("").astype(str).map(clean_text)
-    return out
+# =========================================================
+# 후보 검색
+# =========================================================
+def target_category_from_text(text: str, current_category: str = "") -> str:
+    q = clean_text(text)
+    if any(k in q for k in ["자켓", "재킷", "아우터", "코트", "점퍼", "가디건", "후드", "야상"]):
+        if "가디건" in q:
+            return "니트"
+        return "자켓"
+    if any(k in q for k in ["블라우스"]): return "블라우스"
+    if any(k in q for k in ["셔츠"]): return "셔츠"
+    if any(k in q for k in ["니트", "가디건"]): return "니트"
+    if any(k in q for k in ["상의", "탑", "티셔츠"]): return "블라우스"
+    if any(k in q for k in ["슬랙스", "팬츠", "바지", "데님", "청바지"]): return "팬츠"
+    if any(k in q for k in SHOE_WORDS): return "신발"
+    if any(k in q for k in BAG_WORDS): return "가방"
+    if any(k in q for k in ACC_WORDS): return "악세사리"
+    return current_category or "기타"
 
 
-def parse_uploaded_table(uploaded_file):
-    if uploaded_file is None:
-        return None
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr"]:
+def explicit_target_category_from_text(text: str) -> str:
+    """사용자가 직접 말한 카테고리를 최우선으로 잡습니다. 현재 상품 카테고리보다 우선합니다."""
+    q = clean_text(text)
+    if any(k in q for k in ["팬츠", "바지", "슬랙스", "데님", "청바지"]):
+        return "팬츠"
+    if any(k in q for k in ["자켓", "재킷", "아우터", "코트", "점퍼", "후드", "야상"]):
+        return "자켓"
+    if "가디건" in q:
+        return "니트"
+    if any(k in q for k in ["블라우스"]):
+        return "블라우스"
+    if any(k in q for k in ["셔츠"]):
+        return "셔츠"
+    if any(k in q for k in ["니트"]):
+        return "니트"
+    if any(k in q for k in ["티셔츠", "티", "상의", "탑"]):
+        return "티셔츠"
+    if any(k in q for k in SHOE_WORDS):
+        return "신발"
+    if any(k in q for k in BAG_WORDS):
+        return "가방"
+    if any(k in q for k in ACC_WORDS):
+        return "악세사리"
+    return ""
+
+
+def size_ok_for_user(row: Dict, target_cat: str) -> bool:
+    # Conservative: do not filter too hard; only block clear size miss for clothing
+    b = body_context()
+    user_size = b["bottom_size"] if target_cat in ["팬츠", "스커트"] else b["top_size"]
+    if target_cat == "신발":
+        return True
+    if not user_size: return True
+    lo, hi = parse_size_range(row.get("size_range", ""))
+    rank = size_rank(user_size)
+    if not rank or not hi: return True
+    return rank <= hi
+
+def parse_size_range(text: str) -> Tuple[Optional[int], Optional[int]]:
+    text = clean_text(text).replace("~", "-")
+    found = []
+    for s in ["44", "55반", "55", "66반", "66", "77반", "77", "88", "99"]:
+        if s in text: found.append(SIZE_ORDER[s])
+    if not found and "FREE" in text.upper(): return SIZE_ORDER["55"], SIZE_ORDER["77"]
+    return (min(found), max(found)) if found else (None, None)
+
+def row_category(row: Dict) -> str:
+    return detect_category(f"{row.get('category','')} {row.get('sub_category','')} {row.get('product_name','')}")
+
+def row_category_matches(row: Dict, target_cat: str) -> bool:
+    cat_blob = clean_text(f"{row.get('category','')} {row.get('sub_category','')} {row.get('product_name','')}")
+    cat = row_category(row)
+    if not target_cat or target_cat == "기타":
+        return True
+    if target_cat == "블라우스":
+        return cat in ["블라우스", "셔츠"] or any(k in cat_blob for k in ["블라우스", "셔츠", "블라우스/셔츠"])
+    if target_cat == "셔츠":
+        return cat in ["블라우스", "셔츠"] or "셔츠" in cat_blob
+    if target_cat == "니트":
+        return cat in ["니트", "가디건"] or any(k in cat_blob for k in ["니트", "가디건"])
+    if target_cat == "자켓":
+        return cat == "자켓" or any(k in cat_blob for k in ["자켓", "재킷", "점퍼", "코트", "조끼", "베스트", "아우터", "후드", "야상"])
+    if target_cat == "팬츠":
+        return cat == "팬츠" or any(k in cat_blob for k in ["팬츠", "슬랙스", "바지", "데님", "청바지"])
+    return cat == target_cat or target_cat in cat_blob
+
+def product_reason_from_row(row: Dict, intent: str, user_text: str) -> str:
+    name = clean_text(row.get("product_name", ""))
+    blob = clean_text(f"{name} {row.get('product_summary','')} {row.get('fit_type','')} {row.get('body_cover_features','')} {row.get('style_tags','')} {row.get('fabric','')}")
+    if any(k in user_text for k in ["출근", "회사", "오피스"]):
+        if any(k in blob for k in ["셔츠", "블라우스"]):
+            return "출근룩에 받쳐 입기 좋은 단정한 분위기예요"
+        if any(k in blob for k in ["자켓", "재킷", "아우터"]):
+            return "전체 코디를 깔끔하게 잡아주는 출근용 아우터로 좋아요"
+    if any(k in blob for k in ["핀턱", "배기", "와이드", "여유"]):
+        return "복부나 힙 라인을 너무 드러내지 않고 편하게 정리해줘요"
+    if any(k in blob for k in ["셔츠", "블라우스"]):
+        return "팬츠와 매치했을 때 단정하고 깔끔하게 이어져요"
+    if any(k in blob for k in ["자켓", "재킷"]):
+        return "출근룩이나 모임룩에 단정한 외출 느낌을 더해줘요"
+    if any(k in blob for k in ["가디건", "니트"]):
+        return "부드럽게 걸치기 좋아 과하지 않은 데일리 코디에 좋아요"
+    return clean_text(row.get("product_summary", ""))[:60] or "데일리로 무난하게 활용하기 좋아요"
+
+def find_candidates(intent: str, user_text: str, current: Dict, limit: int = 5) -> List[Dict]:
+    current_cat = current.get("category", "기타")
+    current_no = normalize_product_no(current.get("product_no", ""))
+    q = clean_text(user_text)
+
+    explicit_cat = explicit_target_category_from_text(q)
+    if explicit_cat:
+        target_cat = explicit_cat
+    elif intent == "alternative_recommend":
+        target_cat = current_cat if current_cat != "기타" else target_category_from_text(q, current_cat)
+    elif intent == "coordi_recommend":
+        target_cat = target_category_from_text(q, "팬츠" if current_cat in ["자켓", "블라우스", "셔츠", "니트", "맨투맨", "티셔츠"] else "블라우스")
+    else:
+        target_cat = target_category_from_text(q, current_cat)
+
+    scored = []
+    for row in DB_ROWS:
+        pno = normalize_product_no(row.get("product_no", ""))
+        if current_no and pno == current_no:
+            continue
+        cat = row_category(row)
+        if target_cat and target_cat != "기타" and not row_category_matches(row, target_cat):
+            continue
+        if not size_ok_for_user(row, cat):
+            continue
+        sc = 1
+        blob = f"{row.get('product_name','')} {row.get('category','')} {row.get('sub_category','')} {row.get('style_tags','')} {row.get('body_cover_features','')} {row.get('product_summary','')} {row.get('fabric','')}"
+        # 명시 카테고리와 정확히 맞으면 가중치
+        if explicit_cat and row_category_matches(row, explicit_cat):
+            sc += 5
+        for t in tokens(q):
+            if t in blob:
+                sc += 1
+        if any(k in q for k in ["출근", "학교", "상담", "단정"]):
+            if any(k in blob for k in ["단정", "클래식", "슬랙스", "셔츠", "블라우스", "자켓"]):
+                sc += 2
+        if any(k in q for k in ["힙", "허벅지", "복부", "뱃살"]):
+            if any(k in blob for k in ["커버", "와이드", "배기", "핀턱", "여유", "허리라인"]):
+                sc += 2
+        scored.append((sc, row))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:limit]]
+
+
+def find_compare_target(user_text: str, current: Dict) -> Optional[Dict]:
+    q = clean_text(user_text)
+    q2 = re.sub(r"(이거|이 옷|이 바지|이 슬랙스|비교해줘|비교|둘 중|뭐가 더|어느 게|더 나아|랑|이랑|와|과)", " ", q)
+    q2 = clean_text(q2)
+    scored = []
+    for row in DB_ROWS:
+        if normalize_product_no(row.get("product_no", "")) == normalize_product_no(current.get("product_no", "")): continue
+        sc = name_score(q2, row.get("product_name", ""))
+        if sc > 0: scored.append((sc, row))
+    scored.sort(key=lambda x: -x[0])
+    return scored[0][1] if scored else None
+
+# =========================================================
+# 리뷰/모델 요약
+# =========================================================
+def review_for(product_no: str) -> Dict:
+    if not product_no: return {}
+    return REVIEW_SUMMARY.get(str(product_no), {}) or REVIEW_SUMMARY.get(normalize_product_no(product_no), {}) or {}
+
+def compact_review(product_no: str) -> str:
+    r = review_for(product_no)
+    if not r: return ""
+    parts = []
+    if r.get("review_count"): parts.append(f"후기 {r.get('review_count')}건")
+    for key in ["positive_keywords", "top_good", "fit_keywords", "negative_keywords", "top_bad"]:
+        v = r.get(key)
+        if isinstance(v, list) and v:
+            # may be list of strings or pairs
+            vals = []
+            for item in v[:3]:
+                vals.append(item[0] if isinstance(item, list) else str(item))
+            parts.append("/".join(vals))
+            break
+    if r.get("summary"): parts.append(clean_text(r.get("summary"))[:160])
+    return " | ".join(parts[:3])
+
+def model_hint() -> str:
+    if isinstance(MODEL_PROFILES, dict):
+        models = MODEL_PROFILES.get("models", [])
+    elif isinstance(MODEL_PROFILES, list):
+        models = MODEL_PROFILES
+    else:
+        models = []
+    if not models:
+        return ""
+    vals = []
+    for m in models[:2]:
+        if isinstance(m, dict):
+            h = m.get("height_cm", "")
+            w = m.get("weight_kg", "")
+            if h and w:
+                vals.append(f"{h}cm/{w}kg")
+    return "상세페이지 모델컷은 " + " 또는 ".join(vals) + " 체형 기준입니다. 모델 이름은 고객에게 말하지 않습니다." if vals else ""
+
+def openai_client():
+    if OpenAI is None: return None
+    key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
+    key = key or os.environ.get("OPENAI_API_KEY", "")
+    if not key: return None
+    return OpenAI(api_key=key)
+
+def build_system_prompt() -> str:
+    return f"""
+너는 미샵 쇼핑친구 '미야언니'다. 4050 여성 고객을 옆에서 같이 봐주는 믿음 가는 MD처럼 상담한다.
+
+최우선 원칙:
+1. 고객 질문에 바로 답한다. '사이즈/코디/비교/컬러 중 무엇을 볼까요?' 같은 메뉴형 질문을 하지 않는다.
+2. 결론을 먼저 말하고, 이유를 짧게 붙인다.
+3. 상품DB/리뷰/모델정보는 근거로만 사용한다. 'DB 기준', '상품정보상' 같은 말은 절대 쓰지 않는다.
+4. 추천 상품의 번호 리스트와 링크는 시스템이 별도로 출력한다. 너는 리스트를 직접 만들지 말고, 후보의 성격을 바탕으로 설명만 한다. 없는 상품명을 만들지 않는다. allowed_candidates가 있으면 '추천 가능한 상품이 없다'고 말하지 않는다.
+5. 현재 상품과 선택 상품을 구분한다. '비슷한 다른 상품'은 대체재 추천이고, '어울리는/같이 입을/코디/상의/아우터'는 코디 추천이다.
+6. 66/77 같은 권장사이즈와 실측을 혼동하지 않는다. 권장사이즈는 가능 여부, 실측은 핏 체감 설명에만 쓴다. 배기/세미배기/와이드/부츠컷/일자/라글란/롱/하프 같은 상품 실루엣 특성을 고객 체형 고민과 반드시 연결해서 설명한다.
+7. 고객 이름이 있으면 자연스럽게 이름+님으로 부른다. 없으면 고객님이라고 한다.
+8. 모델 이름은 말하지 않는다. 필요하면 '상세페이지 모델컷 기준'으로만 말한다.
+9. 반복 문장을 피하고, 3~6문장으로 답한다. 사이즈/길이 상담 마지막에는 자연스럽게 '평소 즐겨 입는 팬츠 길이·허리·힙 실측과 비교하면 가장 정확하다'는 식의 선택 기준을 제안한다.
+10. 금지 표현: {', '.join(FORBIDDEN_PHRASES)}
+
+답변 톤:
+- 친구 같은 MD 말투.
+- '입는 건 가능해요', '다만 힙이 있는 편이면', '실패 적게 가시려면', '이쪽이 더 안전해요' 같은 자연스러운 표현을 쓴다.
+""".strip()
+
+def build_context_payload(intent: str, user_text: str, current: Dict) -> Dict:
+    selected = st.session_state.selected_product or {}
+    active = selected if selected.get("product_name") and any(w in user_text for w in ["그", "2번", "3번", "선택", "안에"]) else current
+    candidates = []
+    compare_target = None
+
+    if intent in ["alternative_recommend", "coordi_recommend"]:
+        candidates = find_candidates(intent, user_text, active, limit=5)
+        st.session_state.last_recommendations = candidates[:3]
+    elif intent == "compare":
+        compare_target = find_compare_target(user_text, active)
+        if compare_target:
+            candidates = [compare_target]
+        else:
+            candidates = find_candidates("alternative_recommend", user_text, active, limit=3)
+
+    product_db = active.get("db") or get_db_product(active.get("product_no", "")) or {}
+    allowed = []
+    for row in candidates[:5]:
+        allowed.append({
+            "product_no": row.get("product_no", ""),
+            "product_name": row.get("product_name", ""),
+            "category": row_category(row),
+            "size_range": row.get("size_range", ""),
+            "fit_type": row.get("fit_type", ""),
+            "summary": row.get("product_summary", "")[:220],
+            "body_cover": row.get("body_cover_features", "")[:160],
+            "reason": product_reason_from_row(row, intent, user_text),
+            "review": compact_review(row.get("product_no", "")),
+        })
+    return {
+        "app_version": APP_VERSION,
+        "intent": intent,
+        "customer_call": customer_call(),
+        "customer_body": body_context(),
+        "current_product": {
+            "product_no": current.get("product_no", ""),
+            "product_name": current.get("product_name", ""),
+            "category": current.get("category", ""),
+            "size_range": current.get("size_range", "") or product_db.get("size_range", ""),
+            "fit": current.get("fit", "") or product_db.get("fit_type", ""),
+            "summary": current.get("summary", "")[:450] or product_db.get("product_summary", "")[:450],
+            "colors": current.get("colors", "") or product_db.get("color_options", ""),
+            "measurements": {
+                "shoulder": product_db.get("shoulder", ""),
+                "chest": product_db.get("chest", ""),
+                "waist": product_db.get("waist", ""),
+                "hip": product_db.get("hip", ""),
+                "rise": product_db.get("rise", ""),
+                "thigh": product_db.get("thigh", ""),
+                "hem": product_db.get("hem", ""),
+                "length": product_db.get("length", ""),
+                "raw_measurements": product_db.get("raw_measurements", ""),
+            },
+            "review": compact_review(current.get("product_no", "")),
+        },
+        "selected_product": selected,
+        "allowed_candidates": allowed,
+        "model_hint": model_hint(),
+        "recent_messages": st.session_state.messages[-8:],
+        "situation_context": st.session_state.situation_context,
+    }
+
+
+# =========================================================
+# 빠른 응답: 자주 나오는 사이즈/체형 질문은 GPT 호출 전에 즉시 처리
+# =========================================================
+def particle_eun_neun(name: str) -> str:
+    name = clean_text(name) or "상품"
+    last = name[-1]
+    try:
+        code = ord(last) - ord("가")
+        has_jong = 0 <= code <= 11171 and (code % 28) != 0
+        return f"{name}{'은' if has_jong else '는'}"
+    except Exception:
+        return f"{name}은"
+
+def fast_size_option_answer(user_text: str, current: Dict) -> str:
+    q = clean_text(user_text)
+    q_low = q.lower()
+
+    # M/L, 미디움/라지, 사이즈 선택 질문
+    size_option_words = ["m", "l", "라지", "미디움", "medium", "large", "사이즈", "뭘로", "고르면", "선택", "나을"]
+    if not any(w in q_low for w in size_option_words):
+        return ""
+
+    name = current.get("product_name") or "지금 보시는 상품"
+    cat_text = f"{current.get('category','')} {name}"
+    is_bottom = any(k in cat_text for k in ["슬랙스", "팬츠", "바지", "데님", "스커트", "치마"])
+    base_size = st.session_state.get("body_bottom", "") if is_bottom else st.session_state.get("body_top", "")
+    has_hip = any(k in q for k in ["힙", "골반", "허벅지", "하체"])
+
+    # 66반 하의 고객이 M/L을 묻는 가장 빈번한 케이스
+    if base_size == "66반" or "66반" in q:
+        if has_hip:
+            return f"{base_size or '66반'}에 힙이 있는 편이시면 {particle_eun_neun(name)} M보다는 L 쪽이 더 안전해요. 힙이나 허벅지에서 당기는 느낌이 나면 전체 실루엣이 덜 예뻐질 수 있거든요. 허리는 조금 여유 있을 수 있지만, 편하게 입고 실패 줄이려면 L을 먼저 추천드릴게요."
+        return f"{base_size or '66반'} 기준이면 {particle_eun_neun(name)} M은 깔끔하게 맞는 쪽, L은 조금 더 편한 쪽으로 보시면 좋아요. 편하게 입으실 거면 L, 딱 떨어지는 핏을 원하시면 M 쪽이에요."
+
+    if base_size in ["77", "77반", "88"]:
+        return f"{base_size} 기준이면 {particle_eun_neun(name)} 가능 옵션 중에서는 큰 쪽을 먼저 보시는 게 안전해요. 특히 힙이나 허벅지가 있는 편이면 작은 사이즈는 앉거나 움직일 때 답답하게 느껴질 수 있어요."
+
+    if base_size in ["55", "55반", "66"]:
+        if has_hip:
+            return f"{base_size} 기준이면 {particle_eun_neun(name)} 기본 사이즈도 가능해 보이지만, 힙이나 허벅지가 신경 쓰이면 한 사이즈 여유 있게 보시는 게 더 편해요."
+        return f"{base_size} 기준이면 {particle_eun_neun(name)} 기본 사이즈 쪽부터 보셔도 괜찮아요. 다만 편한 핏을 원하시면 한 사이즈 여유 있게 보는 쪽도 좋습니다."
+
+    return ""
+
+def fast_body_fit_answer(user_text: str, current: Dict) -> str:
+    q = clean_text(user_text)
+    if not any(k in q for k in ["힙", "골반", "허벅지", "하체", "다리 짧", "다리가 짧", "키가 작"]):
+        return ""
+
+    name = current.get("product_name") or "지금 보시는 상품"
+    bottom = st.session_state.get("body_bottom", "")
+
+    if any(k in q for k in ["힙", "골반", "허벅지", "하체"]):
+        if bottom in ["66반", "77", "77반", "88"]:
+            return f"{bottom}에 힙이 있는 편이시면 {particle_eun_neun(name)} 사이즈 선택을 조금 여유 있게 보시는 게 좋아요. 너무 딱 맞게 고르면 힙 쪽이 먼저 당겨 보여서 핏이 덜 예쁠 수 있거든요. 편하게 예쁜 실루엣을 원하시면 가능한 옵션 중 큰 쪽을 먼저 추천드릴게요."
+        return f"{particle_eun_neun(name)} 힙 라인이 신경 쓰이는 분들은 너무 딱 맞게보다 살짝 여유 있게 고르는 쪽이 예뻐요. 하의 사이즈와 옵션을 같이 보면 더 정확하게 잡아드릴 수 있어요."
+
+    if any(k in q for k in ["다리 짧", "다리가 짧", "키가 작"]):
+        return f"{particle_eun_neun(name)} 다리 비율이 걱정되시면 길이와 밑단 라인이 중요해요. 너무 애매하게 끊기는 기장보다 발등 가까이 자연스럽게 떨어지는 쪽이 다리가 더 길어 보여요. 옵션이 있다면 전체 비율이 깔끔하게 이어지는 쪽을 먼저 보시는 게 좋아요."
+
+    return ""
+
+
+def option_values_from_text(text: str) -> List[str]:
+    text = clean_text(text)
+    vals = []
+    for c in COLOR_WORDS:
+        if c in text and c not in vals:
+            vals.append(c)
+    # DB에 콤마/슬래시로 색상이 들어온 경우 보정
+    for part in re.split(r"[,/·|\s]+", text):
+        part = clean_text(part)
+        if part and part in COLOR_WORDS and part not in vals:
+            vals.append(part)
+    return vals
+
+def fast_color_answer(user_text: str, current: Dict) -> str:
+    q = clean_text(user_text)
+    if not any(k in q for k in ["컬러", "색상", "색", "무슨 색", "어떤 색", "골라"]):
+        return ""
+    name = current.get("product_name") or "지금 보시는 상품"
+    colors = option_values_from_text(current.get("colors", "") or current_product_blob(current))
+    top = st.session_state.get("body_top", "")
+    # 출근룩/상체 고민 기준 안전한 컬러 우선순위
+    if any(k in q for k in ["출근", "회사", "오피스", "단정"]):
+        preferred = [c for c in ["아이보리", "베이지", "크림", "네이비", "블랙", "그레이"] if (not colors or c in colors)]
+        pick = preferred[0] if preferred else (colors[0] if colors else "아이보리나 베이지")
+        return f"출근룩으로 자주 입으실 거면 {particle_eun_neun(name)} {pick} 계열을 먼저 추천드려요. 얼굴이 환해 보이고, 슬랙스나 데님에도 단정하게 맞추기 좋아요. 상체가 신경 쓰이시면 너무 강한 색보다 밝고 차분한 톤이 부담이 적습니다."
+    if any(k in q for k in ["상체", "가슴", "부해", "커보"]):
+        pick = "네이비" if (not colors or "네이비" in colors) else ("블랙" if (not colors or "블랙" in colors) else (colors[0] if colors else "차분한 톤"))
+        return f"상체가 커 보이는 게 걱정이면 {particle_eun_neun(name)} {pick}처럼 차분한 컬러가 가장 안전해요. 밝은 컬러는 얼굴은 환해 보이지만 상체 볼륨이 더 도드라질 수 있어서, 핏 여유와 함께 보시는 게 좋아요."
+    if colors:
+        pick = colors[0]
+        return f"색상은 {pick}을 먼저 추천드릴게요. 데일리로 코디하기 쉽고, 4050 출근룩 기준에서도 과하지 않게 정리되는 컬러예요."
+    return f"색상은 밝은 베이지나 크림 계열을 먼저 추천드릴게요. 얼굴을 환하게 해주고 출근룩으로도 무겁지 않게 입기 좋아요."
+
+def fast_answer(user_text: str, current: Dict) -> str:
+    # 색상/추천/핏처럼 반복 테스트가 많은 질문은 GPT 전에 안전 응답을 우선 적용합니다.
+    try:
+        ans = fast_color_answer(user_text, current)
+        if ans:
+            return safe_postprocess(ans, customer_call())
+    except Exception:
+        pass
+
+    # 상품 특성 기반 핏 상담을 가장 먼저 적용합니다.
+    try:
+        ans = product_aware_fit_answer(user_text, current)
+        if ans:
+            return safe_postprocess(ans, customer_call())
+    except Exception:
+        pass
+
+    for fn in (fast_size_option_answer, fast_body_fit_answer):
+        try:
+            ans = fn(user_text, current)
+            if ans:
+                return safe_postprocess(ans, customer_call())
+        except Exception:
+            pass
+    return ""
+
+
+# =========================================================
+# 상품 특성 기반 핏 상담 로직
+# =========================================================
+def current_product_blob(current: Dict) -> str:
+    db = current.get("db") or get_db_product(current.get("product_no", "")) or {}
+    return clean_text(" ".join([
+        current.get("product_name", ""),
+        current.get("category", ""),
+        current.get("summary", ""),
+        current.get("fit", ""),
+        current.get("size_range", ""),
+        current.get("crawl_text", ""),
+        db.get("product_name", ""),
+        db.get("product_summary", ""),
+        db.get("fit_type", ""),
+        db.get("body_cover_features", ""),
+        db.get("style_tags", ""),
+        db.get("fabric", ""),
+        db.get("raw_measurements", ""),
+    ]))
+
+def detect_silhouette(current: Dict) -> Dict:
+    blob = current_product_blob(current)
+    name = clean_text(current.get("product_name", ""))
+    flags = {
+        "semi_baggy": any(k in blob for k in ["세미 배기", "세미배기", "소프트 배기", "배기핏", "배기"]),
+        "wide": any(k in blob for k in ["와이드", "통바지", "넓은"]),
+        "bootcut": any(k in blob for k in ["부츠컷", "세미 부츠"]),
+        "straight": any(k in blob for k in ["일자", "스트레이트"]),
+        "short_length": any(k in blob for k in ["발목", "크롭", "앵클", "9부", "짧게", "짧은", "세미"]),
+        "long_length": any(k in blob for k in ["롱", "풀렝스", "길게", "맥시"]),
+        "pin_tuck": any(k in blob for k in ["핀턱", "턱"]),
+        "raglan": any(k in blob for k in ["라글란"]),
+        "half_length_top": any(k in blob for k in ["하프", "힙을 덮", "힙 덮", "롱셔츠"]),
+    }
+    return flags
+
+def measurement_value(current: Dict, keys: list) -> str:
+    db = current.get("db") or get_db_product(current.get("product_no", "")) or {}
+    for k in keys:
+        v = clean_text(db.get(k, ""))
+        if v:
+            return v
+    raw = clean_text(db.get("raw_measurements", ""))
+    if raw:
+        for k in keys:
+            m = re.search(k + r"[^0-9]{0,8}([0-9]+(?:\.[0-9]+)?)", raw)
+            if m:
+                return m.group(1)
+    return ""
+
+def product_aware_fit_answer(user_text: str, current: Dict) -> str:
+    q = clean_text(user_text)
+    if not any(k in q for k in ["힙", "골반", "허벅지", "하체", "다리", "짧", "키", "길이", "사이즈", "고르면", "맞을까", "어울릴까"]):
+        return ""
+
+    name = current.get("product_name", "지금 보시는 상품")
+    flags = detect_silhouette(current)
+    bottom = st.session_state.get("body_bottom", "")
+    height = st.session_state.get("body_height", "")
+    length = measurement_value(current, ["length", "총장", "기장"])
+    waist = measurement_value(current, ["waist", "허리"])
+    hip = measurement_value(current, ["hip", "힙"])
+    thigh = measurement_value(current, ["thigh", "허벅지"])
+
+    # 힙/허벅지 고민: 현재 상품이 상의/니트/자켓류인 경우에는 팬츠식 사이즈 답변을 하지 않고,
+    # 실제 길이감과 커버 체감 중심으로 답합니다.
+    active_cat = current.get("category", "") or detect_category(name)
+    is_top_like = active_cat in ["니트", "가디건", "블라우스", "셔츠", "티셔츠", "맨투맨", "자켓"] or any(k in name for k in ["니트", "가디건", "블라우스", "셔츠", "티셔츠", "맨투맨", "자켓", "점퍼", "조끼"])
+    if any(k in q for k in ["힙", "골반", "허벅지", "하체"]):
+        if is_top_like:
+            db = current.get("db") or get_db_product(current.get("product_no", "")) or {}
+            length_type = clean_text(db.get("length_type", "") or current.get("length_type", ""))
+            cover = clean_text(db.get("body_cover_features", ""))
+            chest = measurement_value(current, ["chest", "가슴", "가슴둘레"])
+            length_msg = f"총장 {length}cm 기준으로" if length else ("하프 기장이라" if "하프" in length_type or "하프" in name else "기장감상")
+            chest_msg = f"가슴둘레가 {chest}cm 정도라 상체는 너무 붙지 않고," if chest else "루즈하게 떨어지는 핏이라 상체는 너무 붙지 않고,"
+            if "힙커버" in cover or "하프" in length_type or flags["half_length_top"]:
+                return (
+                    f"{bottom or '66반'} 체형 기준으로 {particle_eun_neun(name)} 힙을 완전히 덮는 롱기장이라기보다는, {length_msg} 힙 윗부분과 골반선을 자연스럽게 덜어주는 쪽으로 보시면 좋아요. "
+                    f"{chest_msg} 밑단도 바디에 딱 달라붙는 타입이 아니라서 힙이 있는 편이어도 부담은 크지 않을 거예요. "
+                    f"다만 힙 전체를 확실히 가리고 싶으시면 롱 셔츠나 하프 점퍼처럼 뒤 기장이 더 내려오는 아우터를 함께 매치하시는 게 더 안전합니다."
+                )
+            return (
+                f"{particle_eun_neun(name)} 힙을 길게 가려주는 상품이라기보다는 상체 라인을 편하게 정리해주는 쪽에 가까워요. "
+                f"힙이 많이 신경 쓰이시면 하의는 와이드나 세미배기처럼 힙 라인을 붙이지 않는 팬츠로 맞추면 훨씬 안정적입니다."
+            )
+
+        if flags["semi_baggy"] or flags["wide"] or flags["pin_tuck"]:
+            details = []
+            if hip: details.append(f"힙 {hip}")
+            if thigh: details.append(f"허벅지 {thigh}")
+            if waist: details.append(f"허리 {waist}")
+            detail_text = f" 실측은 {' / '.join(details)} 정도라," if details else ""
+            return (
+                f"{bottom or '입력하신 하의 사이즈'} 기준으로 보면 {particle_eun_neun(name)} 오히려 힙이나 하체가 신경 쓰이는 분께 잘 맞는 타입이에요. "
+                f"세미 배기나 핀턱 계열은 힙을 붙여서 드러내기보다 여유 있게 떨어져서, 힙이 있으셔도 부담을 덜어주는 쪽이거든요."
+                f"{detail_text} 평소 즐겨 입으시는 팬츠의 허리·힙·허벅지 실측과 비교해보시면 가장 정확해요. "
+                f"너무 타이트하게 입는 걸 좋아하지 않으시면 정사이즈를 먼저 보시고, 허리보다 힙이 많이 신경 쓰이는 체형이면 한 단계 여유도 함께 비교해보시면 좋아요."
+            )
+        return (
+            f"{bottom or '입력하신 하의 사이즈'} 기준으로 힙이 신경 쓰이신다면 {particle_eun_neun(name)} 허리보다 힙과 허벅지 여유를 먼저 보시는 게 좋아요. "
+            f"핏이 너무 붙는 타입이면 한 사이즈 여유가 안전하고, 여유핏이면 정사이즈도 충분히 보실 수 있어요. "
+            f"평소 편하게 입는 팬츠의 힙·허벅지 실측과 비교해보시는 게 가장 정확합니다."
+        )
+
+    # 다리 짧음/키/길이 고민: 짧은 세미배기/앵클 계열은 긍정 상담
+    if any(k in q for k in ["다리", "짧", "키", "길이"]):
+        if flags["semi_baggy"] or flags["short_length"] or flags["straight"]:
+            len_text = f" 총장 {length}cm 기준으로" if length else ""
+            return (
+                f"다리 비율이 걱정되신다면 {particle_eun_neun(name)} 오히려 괜찮게 보실 수 있어요."
+                f"{len_text} 일반 롱 슬랙스처럼 길게 끌리는 타입보다 살짝 짧고 딱 떨어지는 세미 배기핏이라, "
+                f"수선 없이 입었을 때 발목선이 정리되면 다리가 답답해 보이지 않는 장점이 있어요. "
+                f"다만 체감 길이는 고객님이 평소 즐겨 입는 팬츠 총장, 이 상품의 총장, 그리고 상세페이지 모델컷의 떨어지는 위치를 함께 비교해보시면 가장 정확합니다."
+            )
+        return (
+            f"다리 비율이 걱정되시면 {particle_eun_neun(name)} 전체 총장과 밑단이 떨어지는 위치를 같이 보시는 게 좋아요. "
+            f"너무 길어 끌리면 오히려 짧아 보일 수 있고, 발등 가까이 자연스럽게 떨어지면 비율이 좋아 보여요. "
+            f"평소 즐겨 입는 팬츠 길이와 상품 총장을 비교해보시는 것이 가장 정확한 선택법입니다."
+        )
+
+    return ""
+
+
+
+# =========================================================
+# 하이브리드 추천 안정화
+# - 코드: DB 후보 검색 / 상품명 / 링크 / 번호 형식 통제
+# - GPT: 후보 중 우선순위 판단 / 고객 체형·상황 기반 추천 이유 작성
+# =========================================================
+def product_link(row: Dict) -> str:
+    url = clean_text(row.get("product_url", ""))
+    if url:
+        return url
+    pno = normalize_product_no(row.get("product_no", ""))
+    if pno:
+        return f"https://www.misharp.co.kr/product/detail.html?product_no={pno}"
+    return ""
+
+def strip_numbered_list_from_gpt(text: str) -> str:
+    ans = clean_text(text)
+    ans = re.sub(r"(^|\s)(\d+)\s*[\.\)]\s*[^.?!요]{0,80}", " ", ans)
+    ans = re.sub(r"\d+\s*번\s*", "", ans)
+    ans = re.sub(r"\s+", " ", ans).strip()
+    return ans
+
+def recommendation_heading(intent: str, user_text: str, current: Dict) -> str:
+    q = clean_text(user_text)
+    current_name = current.get("product_name", "지금 보시는 상품")
+    explicit_cat = explicit_target_category_from_text(q)
+    if explicit_cat == "팬츠":
+        return "같이 입기 좋은 팬츠 쪽으로 골라드릴게요."
+    if explicit_cat in ["블라우스", "셔츠", "티셔츠"]:
+        return "출근룩으로 같이 입기 좋은 상의 쪽으로 골라드릴게요."
+    if explicit_cat in ["자켓", "니트"]:
+        return "바지 말고 전체 실루엣을 잡아줄 아우터 쪽으로 골라드릴게요." if any(k in q for k in ["바지말고", "바지 말고", "팬츠말고", "팬츠 말고", "대체"]) else "함께 걸치기 좋은 아우터 쪽으로 골라드릴게요."
+    if explicit_cat == "신발":
+        return "이 코디에 맞는 신발 쪽으로 골라드릴게요."
+    if explicit_cat == "가방":
+        return "전체 분위기에 맞는 가방 쪽으로 골라드릴게요."
+    if intent == "alternative_recommend":
+        return f"{particle_wa_gwa(current_name)} 비슷한 무드에서 대안으로 볼 만한 상품이에요."
+    return "같이 입기 좋은 상품으로 골라드릴게요."
+
+
+def fallback_reason_for_candidate(row: Dict, intent: str, user_text: str) -> str:
+    return product_reason_from_row(row, intent, user_text)
+
+def rank_candidates_with_gpt(user_text: str, current: Dict, intent: str, candidates: List[Dict]) -> List[Dict]:
+    """
+    GPT가 후보를 새로 만들지 않고, 코드가 준 candidate_id 중에서만 TOP3를 고르게 합니다.
+    반환 형식:
+    [{"candidate_id": 1, "reason": "..."}]
+    """
+    client = openai_client()
+    if client is None or not candidates:
+        return []
+
+    candidate_payload = []
+    for i, row in enumerate(candidates[:8], 1):
+        candidate_payload.append({
+            "candidate_id": i,
+            "product_name": clean_text(row.get("product_name", "")),
+            "category": row_category(row),
+            "size_range": clean_text(row.get("size_range", "")),
+            "fit_type": clean_text(row.get("fit_type", "")),
+            "summary": clean_text(row.get("product_summary", ""))[:180],
+            "body_cover": clean_text(row.get("body_cover_features", ""))[:120],
+            "style_tags": clean_text(row.get("style_tags", ""))[:100],
+            "review": compact_review(row.get("product_no", "")),
+        })
+
+    payload = {
+        "user_text": user_text,
+        "intent": intent,
+        "customer_body": body_context(),
+        "current_product": {
+            "product_name": current.get("product_name", ""),
+            "category": current.get("category", ""),
+            "summary": current.get("summary", "")[:220],
+            "fit": current.get("fit", ""),
+            "colors": current.get("colors", ""),
+        },
+        "candidate_products": candidate_payload,
+        "rule": "candidate_id 안에서만 3개를 고르고, 각 상품 추천 이유를 1문장으로 작성하세요. 상품명을 새로 만들지 마세요. 번호는 candidate_id만 사용하세요."
+    }
+
+    system = """
+너는 4050 여성 패션 MD다.
+사용자가 원하는 코디/대체상품 목적에 맞춰 후보 상품 중 TOP3만 고른다.
+반드시 제공된 candidate_id 중에서만 선택한다.
+없는 상품명, 없는 번호, candidate_id 밖의 번호를 만들지 않는다.
+응답은 JSON만 출력한다.
+형식:
+{"picks":[{"candidate_id":1,"reason":"추천 이유 1문장"},{"candidate_id":2,"reason":"추천 이유 1문장"},{"candidate_id":3,"reason":"추천 이유 1문장"}]}
+""".strip()
+
+    try:
+        model_name = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+                ],
+                temperature=0.2,
+                max_tokens=420,
+            )
+        except Exception:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+                ],
+                max_tokens=420,
+            )
+        raw = resp.choices[0].message.content.strip()
+        # JSON 앞뒤 잡음 방지
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return []
+        data = json.loads(m.group(0))
+        picks = data.get("picks", [])
+        if not isinstance(picks, list):
+            return []
+        cleaned = []
+        used = set()
+        for p in picks:
             try:
-                uploaded_file.seek(0)
-                return pd.read_csv(uploaded_file, encoding=enc)
+                cid = int(p.get("candidate_id"))
             except Exception:
                 continue
-        uploaded_file.seek(0)
-        return pd.read_csv(uploaded_file)
-    if name.endswith(".xlsx"):
-        uploaded_file.seek(0)
-        return pd.read_excel(uploaded_file)
-    if name.endswith(".jsonl") or name.endswith(".log"):
-        uploaded_file.seek(0)
-        text = uploaded_file.read().decode("utf-8", errors="replace")
-        return _parse_jsonl_log(text)
-    if name.endswith(".json"):
-        uploaded_file.seek(0)
-        obj = json.load(uploaded_file)
-        if isinstance(obj, list):
-            return pd.DataFrame(obj)
-        if isinstance(obj, dict):
-            for key in ["rows", "data", "logs", "items"]:
-                if isinstance(obj.get(key), list):
-                    return pd.DataFrame(obj[key])
-            return pd.DataFrame([obj])
-    return None
+            if cid < 1 or cid > len(candidates[:8]) or cid in used:
+                continue
+            used.add(cid)
+            reason = clean_text(p.get("reason", ""))
+            row = dict(candidates[cid-1])
+            row["_gpt_reason"] = reason
+            cleaned.append(row)
+            if len(cleaned) >= 3:
+                break
+        return cleaned
+    except Exception as e:
+        st.session_state.last_error = f"rank_candidates_with_gpt: {e}"
+        return []
+
+def markdown_product_line(i: int, row: Dict) -> str:
+    name = clean_text(row.get("product_name", "")) or "추천 상품"
+    url = product_link(row)
+    size = clean_text(row.get("size_range", ""))
+    reason = clean_text(row.get("_gpt_reason", "")) or fallback_reason_for_candidate(row, "coordi_recommend", "")
+    size_part = f" ({size})" if size else ""
+    if url:
+        return f'<div class="rec-item">{i}. <a href="{url}" target="_blank" rel="noopener noreferrer">{name}</a>{size_part} — {reason}</div>'
+    return f'<div class="rec-item">{i}. {name}{size_part} — {reason}</div>'
 
 
-def compare_db(current_df: pd.DataFrame, new_df: pd.DataFrame):
-    current_df = ensure_db_columns(current_df)
-    new_df = ensure_db_columns(new_df)
-    current_no = set(current_df["product_no"].astype(str)) if not current_df.empty else set()
-    new_no = set(new_df["product_no"].astype(str)) if not new_df.empty else set()
-    added = sorted(new_no - current_no)
-    removed = sorted(current_no - new_no)
-    same = sorted(current_no & new_no)
+def build_recommendation_answer(user_text: str, current: Dict) -> str:
+    intent = detect_intent(user_text)
+    if intent not in ["coordi_recommend", "alternative_recommend"]:
+        return ""
 
-    changed_rows = []
-    current_map = current_df.set_index("product_no").to_dict(orient="index") if not current_df.empty else {}
-    new_map = new_df.set_index("product_no").to_dict(orient="index") if not new_df.empty else {}
-    for pno in same:
-        before = current_map.get(pno, {})
-        after = new_map.get(pno, {})
-        changed_cols = [c for c in DB_COLUMNS if clean_text(before.get(c, "")) != clean_text(after.get(c, ""))]
-        if changed_cols:
-            changed_rows.append({
-                "product_no": pno,
-                "product_name": after.get("product_name") or before.get("product_name"),
-                "changed_columns": ", ".join(changed_cols),
-                "changed_count": len(changed_cols),
-            })
+    # 후보는 넉넉히 뽑고, GPT가 그 안에서 TOP3를 고르게 함
+    raw_candidates = find_candidates(intent, user_text, current, limit=8)
+    if not raw_candidates:
+        return ""
 
-    added_df = new_df[new_df["product_no"].isin(added)].copy() if added else pd.DataFrame(columns=DB_COLUMNS)
-    removed_df = current_df[current_df["product_no"].isin(removed)].copy() if removed else pd.DataFrame(columns=DB_COLUMNS)
-    changed_df = pd.DataFrame(changed_rows)
-    return added_df, removed_df, changed_df
-
-
-def guess_column(df: pd.DataFrame, candidates):
-    cols = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        for lc, original in cols.items():
-            if cand in lc:
-                return original
-    return None
-
-
-def _parse_jsonl_log(text: str) -> pd.DataFrame:
-    """미야언니 V2 JSONL 구조화 로그 파싱"""
-    rows = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except Exception:
-            # JSON 파싱 실패 시 탭 구분 레거시 포맷 시도
-            parts = line.split("\t")
-            if len(parts) >= 4:
-                ts_str = parts[0].strip()
-                role = parts[1].strip() if len(parts) > 1 else ""
-                pno = parts[2].strip() if len(parts) > 2 else ""
-                content = parts[3].strip() if len(parts) > 3 else ""
-                event_map = {"USER": "user_message", "MIYA": "assistant_response", "LLM_ERROR": "error"}
-                rows.append({
-                    "timestamp": ts_str,
-                    "event_type": event_map.get(role, role),
-                    "product_no": pno,
-                    "user_text": content if role == "USER" else "",
-                    "bot_text": content if role == "MIYA" else "",
-                    "error_text": content if role == "LLM_ERROR" else "",
-                })
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-
-def normalize_log_df(df: pd.DataFrame) -> pd.DataFrame:
-    """미야언니 V2 구조화 로그 → 관리프로그램 표준 형식으로 변환"""
-    EMPTY_COLS = [
-        "timestamp", "event_type", "session_id", "product_no", "product_name",
-        "user_text", "bot_text", "response_mode", "fallback_reason", "is_fallback",
-        "error_text", "latency_ms", "date", "is_error", "is_rate_limit",
-    ]
-    if df is None or df.empty:
-        return pd.DataFrame(columns=EMPTY_COLS)
-
-    out = df.copy()
-    out.columns = [clean_text(c) for c in out.columns]
-
-    # ── 필수 컬럼 보장
-    str_cols = ["event_type", "session_id", "product_no", "product_name",
-                "user_text", "bot_text", "response_mode", "fallback_reason", "error_text"]
-    for col in str_cols:
-        if col not in out.columns:
-            out[col] = ""
-        out[col] = out[col].astype(str).map(clean_text)
-
-    # event_type 정규화
-    etype_map = {
-        "user": "user_message", "user_msg": "user_message", "question": "user_message",
-        "assistant": "assistant_response", "miya": "assistant_response", "response": "assistant_response",
-        "llm_error": "error", "rate_limit": "error",
-    }
-    out["event_type"] = out["event_type"].str.lower().replace(etype_map).fillna("unknown")
-
-    # timestamp
-    out["timestamp"] = pd.to_datetime(out["timestamp"], errors="coerce")
-
-    # latency_ms
-    if "latency_ms" not in out.columns:
-        out["latency_ms"] = pd.NA
-    out["latency_ms"] = pd.to_numeric(out["latency_ms"], errors="coerce")
-
-    # is_fallback
-    if "is_fallback" not in out.columns:
-        out["is_fallback"] = False
-    fb = out["is_fallback"]
-    if fb.dtype != bool:
-        out["is_fallback"] = fb.astype(str).str.lower().isin(["1", "true", "yes", "y"])
-    out["is_fallback"] = out["is_fallback"].fillna(False) | out["event_type"].eq("fallback") | out["response_mode"].str.contains("fallback", na=False)
-
-    # 파생 컬럼
-    out["date"] = out["timestamp"].dt.date
-    out["is_error"] = out["event_type"].eq("error") | out["error_text"].ne("")
-    out["is_rate_limit"] = out["error_text"].str.contains("rate|RateLimit", case=False, na=False)
-
-    # product_no URL 보정
-    if "url" in out.columns:
-        mask = out["product_no"].eq("")
-        out.loc[mask, "product_no"] = out.loc[mask, "url"].astype(str).map(extract_product_no)
-
-    return out[EMPTY_COLS + [c for c in out.columns if c not in EMPTY_COLS]]
-
-def build_log_template():
-    rows = [
-        {
-            "timestamp": "2026-03-30 09:10:11",
-            "event_type": "user_message",
-            "session_id": "sess_001",
-            "product_no": "28628",
-            "product_name": "쓰리 핀턱 소프트 배기핏 슬랙스",
-            "user_text": "77도 가능할까요?",
-            "response_mode": "llm",
-            "fallback_reason": "",
-            "is_fallback": False,
-            "error_text": "",
-            "latency_ms": 0,
-        },
-        {
-            "timestamp": "2026-03-30 09:10:12",
-            "event_type": "assistant_response",
-            "session_id": "sess_001",
-            "product_no": "28628",
-            "product_name": "쓰리 핀턱 소프트 배기핏 슬랙스",
-            "user_text": "77도 가능할까요?",
-            "response_mode": "llm",
-            "fallback_reason": "",
-            "is_fallback": False,
-            "error_text": "",
-            "latency_ms": 820,
-        },
-        {
-            "timestamp": "2026-03-30 09:12:00",
-            "event_type": "fallback",
-            "session_id": "sess_002",
-            "product_no": "28659",
-            "product_name": "3타입 스트레치 핀턱 와이드 슬랙스",
-            "user_text": "77도 맞나요?",
-            "response_mode": "fallback",
-            "fallback_reason": "size_info_uncertain",
-            "is_fallback": True,
-            "error_text": "",
-            "latency_ms": 1120,
-        },
-        {
-            "timestamp": "2026-03-30 09:13:40",
-            "event_type": "error",
-            "session_id": "sess_003",
-            "product_no": "",
-            "product_name": "",
-            "user_text": "배송 얼마나 걸려요?",
-            "response_mode": "rule",
-            "fallback_reason": "",
-            "is_fallback": False,
-            "error_text": "RateLimitError",
-            "latency_ms": 0,
-        },
-    ]
-    return pd.DataFrame(rows)
-
-def load_logs_from_folder(folder_path: str) -> pd.DataFrame:
-    """logs 폴더의 JSONL/CSV/XLSX/JSON 로그 파일 전체 로드"""
-    if not folder_path:
-        return pd.DataFrame()
-    if not os.path.isdir(folder_path):
-        return pd.DataFrame()
-    frames = []
-    for fname in sorted(os.listdir(folder_path)):
-        lower = fname.lower()
-        # .log 확장자(레거시 탭 구분 로그)도 지원
-        if not lower.endswith((".csv", ".xlsx", ".json", ".jsonl", ".log")):
-            continue
-        full = os.path.join(folder_path, fname)
-        try:
-            if lower.endswith((".jsonl", ".log")):
-                text = open(full, encoding="utf-8", errors="replace").read()
-                loaded = _parse_jsonl_log(text)
-            elif lower.endswith(".csv"):
-                loaded = None
-                for enc in ["utf-8-sig", "utf-8", "cp949", "euc-kr"]:
-                    try:
-                        loaded = pd.read_csv(full, encoding=enc)
-                        break
-                    except Exception:
-                        continue
-                if loaded is None:
-                    continue
-            elif lower.endswith(".xlsx"):
-                loaded = pd.read_excel(full)
-            else:  # .json
-                text = open(full, encoding="utf-8", errors="replace").read()
-                try:
-                    obj = json.loads(text)
-                    if isinstance(obj, list):
-                        loaded = pd.DataFrame(obj)
-                    elif isinstance(obj, dict):
-                        for key in ["rows", "data", "logs", "items"]:
-                            if isinstance(obj.get(key), list):
-                                loaded = pd.DataFrame(obj[key])
-                                break
-                        else:
-                            loaded = pd.DataFrame([obj])
-                    else:
-                        continue
-                except Exception:
-                    loaded = _parse_jsonl_log(text)  # JSON Lines 재시도
-            if loaded is not None and not loaded.empty:
-                loaded["_source_file"] = fname
-                frames.append(loaded)
-        except Exception:
-            continue
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
-
-
-def filter_log_df(log_df: pd.DataFrame, date_range=None, event_types=None):
-    if log_df is None or log_df.empty:
-        return pd.DataFrame()
-    out = log_df.copy()
-    if date_range and len(date_range) == 2 and date_range[0] and date_range[1]:
-        start_date, end_date = date_range
-        out = out[(out["timestamp"].dt.date >= start_date) & (out["timestamp"].dt.date <= end_date)]
-    if event_types:
-        out = out[out["event_type"].isin(event_types)]
-    return out
-
-
-def compute_overall_metrics(log_df: pd.DataFrame) -> dict:
-    if log_df is None or log_df.empty:
-        return {
-            "total_consults": 0,
-            "fallback_count": 0,
-            "error_count": 0,
-            "avg_latency": None,
-            "daily_consults": pd.DataFrame(),
-        }
-    consult_mask = log_df["event_type"].astype(str).str.contains("user", case=False, na=False)
-    total_consults = int(consult_mask.sum())
-    fallback_count = int(log_df["event_type"].eq("fallback").sum())
-    error_count = int(log_df["event_type"].eq("error").sum())
-    avg_latency = pd.to_numeric(log_df.loc[log_df["event_type"].eq("assistant_response"), "latency_ms"], errors="coerce").dropna().mean()
-    daily_consults = pd.DataFrame()
-    valid = log_df.dropna(subset=["timestamp"]).copy()
-    if not valid.empty:
-        daily_consults = valid[valid["event_type"].eq("user_message")].groupby(valid[valid["event_type"].eq("user_message")]["timestamp"].dt.date).size().to_frame("상담 수")
-    return {
-        "total_consults": total_consults,
-        "fallback_count": fallback_count,
-        "error_count": error_count,
-        "avg_latency": avg_latency,
-        "daily_consults": daily_consults,
-    }
-
-
-def compute_product_analysis(log_df: pd.DataFrame) -> pd.DataFrame:
-    if log_df is None or log_df.empty:
-        return pd.DataFrame(columns=["product_no", "product_name", "상품별 상담 수", "fallback 발생 횟수", "fallback 발생률(%)"])
-    base = log_df[log_df["product_no"].astype(str).ne("")].copy()
-    if base.empty:
-        return pd.DataFrame(columns=["product_no", "product_name", "상품별 상담 수", "fallback 발생 횟수", "fallback 발생률(%)"])
-    consults = base[base["event_type"].eq("user_message")].groupby(["product_no", "product_name"], dropna=False).size().to_frame("상품별 상담 수")
-    fallbacks = base[base["event_type"].eq("fallback")].groupby(["product_no", "product_name"], dropna=False).size().to_frame("fallback 발생 횟수")
-    merged = consults.join(fallbacks, how="outer").fillna(0).reset_index()
-    merged["상품별 상담 수"] = merged["상품별 상담 수"].astype(int)
-    merged["fallback 발생 횟수"] = merged["fallback 발생 횟수"].astype(int)
-    merged["fallback 발생률(%)"] = merged.apply(lambda r: round((r["fallback 발생 횟수"] / r["상품별 상담 수"] * 100), 1) if r["상품별 상담 수"] else 0.0, axis=1)
-    return merged.sort_values(["상품별 상담 수", "fallback 발생 횟수"], ascending=[False, False])
-
-
-def compute_quality_analysis(log_df: pd.DataFrame) -> dict:
-    if log_df is None or log_df.empty:
-        return {"fallback_ratio": 0.0, "response_mode_ratio": pd.DataFrame(), "error_logs": pd.DataFrame()}
-    total_consults = int(log_df["event_type"].eq("user_message").sum())
-    fallback_count = int(log_df["event_type"].eq("fallback").sum())
-    fallback_ratio = round((fallback_count / total_consults * 100), 1) if total_consults else 0.0
-    responses = log_df[log_df["event_type"].eq("assistant_response")].copy()
-    if responses.empty:
-        response_mode_ratio = pd.DataFrame(columns=["response_mode", "count", "ratio"])
+    ranked = rank_candidates_with_gpt(user_text, current, intent, raw_candidates)
+    if ranked:
+        candidates = list(ranked)
+        used_nos = {normalize_product_no(r.get("product_no", "")) for r in candidates}
+        for row in raw_candidates:
+            pno = normalize_product_no(row.get("product_no", ""))
+            if pno not in used_nos:
+                candidates.append(row)
+                used_nos.add(pno)
+            if len(candidates) >= 3:
+                break
     else:
-        response_mode_ratio = responses["response_mode"].replace("", pd.NA).fillna("unknown").value_counts().reset_index()
-        response_mode_ratio.columns = ["response_mode", "count"]
-        response_mode_ratio["ratio"] = (response_mode_ratio["count"] / response_mode_ratio["count"].sum() * 100).round(1)
-    error_logs = log_df[log_df["event_type"].eq("error") | log_df["error_text"].ne("")][[
-        "timestamp", "session_id", "product_no", "product_name", "user_text", "error_text", "response_mode"
-    ]].copy()
-    return {"fallback_ratio": fallback_ratio, "response_mode_ratio": response_mode_ratio, "error_logs": error_logs}
+        candidates = raw_candidates[:3]
+
+    st.session_state.last_recommendations = candidates[:3]
+
+    heading = recommendation_heading(intent, user_text, current)
+    item_lines = []
+    for i, row in enumerate(candidates[:3], 1):
+        item_lines.append(markdown_product_line(i, row))
+
+    q = clean_text(user_text)
+    explicit_cat = explicit_target_category_from_text(q)
+    if explicit_cat == "팬츠":
+        tail = "상의와 연결했을 때 하체 라인을 정리해주고, 고객님 하의 사이즈 기준으로도 비교해볼 만한 팬츠들이에요."
+    elif any(k in q for k in ["출근", "회사", "오피스"]):
+        tail = "위 상품들은 출근룩 기준으로 너무 캐주얼하지 않고, 팬츠와 같이 입었을 때 전체 분위기가 단정하게 정리되는 쪽이에요."
+    elif any(k in q for k in ["검정", "블랙"]):
+        tail = "블랙 팬츠와 맞출 때는 상의나 아우터가 너무 무겁지 않게 정리되는 쪽이 좋아서, 밝은 톤이나 차분한 기본 컬러 위주로 보시면 실패가 적어요."
+    elif intent == "alternative_recommend":
+        tail = "비슷한 느낌 안에서 비교하실 때는 핏 여유, 총장, 허리·힙 실측을 같이 보시면 선택이 더 정확해요."
+    else:
+        tail = "마음 가는 번호를 말씀해주시면 그 상품 기준으로 사이즈감과 코디까지 이어서 봐드릴게요."
+
+    return f"{heading}<div class=\"rec-list\">{''.join(item_lines)}</div><div class=\"rec-tail\">{tail}</div>"
 
 
-def merge_db_names(log_df: pd.DataFrame, db_df: pd.DataFrame) -> pd.DataFrame:
-    if log_df is None or log_df.empty:
-        return pd.DataFrame()
-    out = log_df.copy()
-    if db_df is not None and not db_df.empty and "product_no" in db_df.columns:
-        product_map = db_df[["product_no", "product_name"]].drop_duplicates()
-        out = out.merge(product_map, on="product_no", how="left", suffixes=("", "_db"))
-        out["product_name"] = out["product_name"].replace("", pd.NA).fillna(out.get("product_name_db", ""))
-        if "product_name_db" in out.columns:
-            out = out.drop(columns=["product_name_db"])
-    return out
+def call_gpt(user_text: str, current: Dict) -> Optional[str]:
+    client = openai_client()
+    if client is None: return None
+    intent = detect_intent(user_text)
+    payload = build_context_payload(intent, user_text, current)
+    try:
+        model_name = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini")
+        try:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role":"system", "content": build_system_prompt()},
+                    {"role":"user", "content": json.dumps({"user_text": user_text, "context": payload}, ensure_ascii=False)}
+                ],
+                temperature=0.3,
+                max_tokens=520,
+            )
+        except Exception:
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role":"system", "content": build_system_prompt()},
+                    {"role":"user", "content": json.dumps({"user_text": user_text, "context": payload}, ensure_ascii=False)}
+                ],
+                max_tokens=520,
+            )
+        answer = resp.choices[0].message.content.strip()
+        return safe_postprocess(answer, payload["customer_call"])
+    except Exception as e:
+        st.session_state.last_error = str(e)
+        return None
 
-def get_today_log_df(log_df: pd.DataFrame) -> pd.DataFrame:
-    if log_df is None or log_df.empty or "timestamp" not in log_df.columns:
-        return pd.DataFrame()
-    ts = pd.to_datetime(log_df["timestamp"], errors="coerce")
-    today = pd.Timestamp.now().date()
-    return log_df[ts.dt.date == today].copy()
+# =========================================================
+# GPT 미사용 시 안전 fallback
+# =========================================================
+def fallback_answer(user_text: str, current: Dict) -> str:
+    intent = detect_intent(user_text)
+    call = customer_call()
+    name = current.get("product_name", "지금 보시는 상품")
+    cat = current.get("category", "")
+    b = body_context()
+    if intent == "fit_size":
+        product_fit = product_aware_fit_answer(user_text, current)
+        if product_fit:
+            return product_fit
+        if any(k in user_text for k in ["힙", "허벅지", "골반"]):
+            return f"{call}, {name}은 힙이나 허벅지가 있는 편이면 허리보다 힙과 허벅지 실측을 먼저 보시는 게 좋아요. 편하게 예쁜 핏을 원하시면 평소 즐겨 입는 팬츠의 허리·힙·허벅지와 비교해보시는 게 가장 정확합니다."
+        if any(k in user_text for k in ["다리", "짧", "키"]):
+            return f"{call}, 다리 비율이 걱정되시면 {name}은 전체 총장과 밑단이 떨어지는 위치를 같이 보시면 좋아요. 평소 즐겨 입는 팬츠 길이와 이 상품의 총장을 비교해보시는 게 가장 정확합니다."
+        return f"{call}, {name}은 현재 입력하신 사이즈 기준으로 먼저 가능 여부를 보고, 그다음 핏 체감을 봐야 해요. 편하게 입고 싶으시면 실측 여유와 후기 반응까지 같이 보는 쪽이 안전해요."
+    if intent == "feature":
+        return f"{call}, {name}의 장점은 데일리로 입기 부담 없는 안정적인 핏이에요. 너무 과하게 멋낸 느낌보다 깔끔하게 정리되는 쪽이라 출근이나 일상 코디에 활용하기 좋아요."
+    if intent == "option_choice":
+        if "일자" in user_text and "부츠컷" in user_text:
+            return f"{call}, 다리가 짧게 느껴지는 편이면 일자 쪽이 더 안전해요. 부츠컷은 예쁘지만 기장 영향을 더 받아서 비율이 민감할 수 있어요. 실패 적게 가시려면 일자 먼저 추천드려요."
+        if "숏" in user_text and "롱" in user_text:
+            return f"{call}, 키가 작거나 다리 비율이 걱정되시면 롱을 무조건 고르기보다 신발과 기장을 같이 봐야 해요. 발등을 살짝 덮는 정도면 길어 보이고, 끌리면 오히려 답답해 보여요."
+    if intent == "alternative_recommend":
+        cands = find_candidates("alternative_recommend", user_text, current, limit=3)
+        if cands:
+            st.session_state.last_recommendations = cands
+            lines = [f"{call}, 지금 보시는 {name}과 비슷한 무드에서 대안으로 볼 만한 상품을 골라드릴게요."]
+            for i, row in enumerate(cands, 1):
+                lines.append(f"{i}. {row.get('product_name')} — {row.get('size_range','')} / {product_reason_from_row(row, intent, user_text)}")
+            return "\n".join(lines)
+        return f"{call}, 비슷한 대안 상품을 바로 많이 잡지는 못했어요. 그래도 같은 카테고리 안에서 더 여유 있는 쪽으로 다시 골라드릴게요."
+    if intent == "coordi_recommend":
+        cands = find_candidates("coordi_recommend", user_text, current, limit=3)
+        if cands:
+            st.session_state.last_recommendations = cands
+            lines = [f"{call}, {name} 기준으로 같이 입기 좋은 쪽으로 골라드릴게요."]
+            for i, row in enumerate(cands, 1):
+                lines.append(f"{i}. {row.get('product_name')} — {row.get('size_range','')} / {product_reason_from_row(row, intent, user_text)}")
+            return "\n".join(lines)
+        return f"{call}, {name}에는 너무 캐주얼한 것보다 깔끔한 슬랙스나 블라우스 계열이 안정적이에요."
+    if intent == "color":
+        return f"{call}, 단정하게 입으실 거면 블랙·아이보리·베이지처럼 차분한 컬러가 가장 안전해요. 상체가 도드라져 보이는 게 걱정이면 너무 강한 색보다 차분한 톤을 추천드려요."
+    if intent == "compare":
+        return f"{call}, 비교는 현재 보고 계신 {name}을 기준으로 사이즈 안정감, 핏, 활용도를 나눠서 보는 게 좋아요. 비교할 상품명을 조금만 더 알려주시면 어느 쪽이 더 나은지 결론까지 같이 말씀드릴게요."
+    return f"{call}, 지금 질문은 {name} 기준으로 같이 볼게요. 입었을 때 느낌과 실제 활용도를 중심으로 바로 상담드릴게요."
 
-
-def compute_chat_metrics(log_df: pd.DataFrame) -> dict:
-    if log_df is None or log_df.empty:
-        return {
-            "today_consults": 0,
-            "today_sessions": 0,
-            "avg_latency": None,
-            "fallback_count": 0,
-            "error_count": 0,
-            "rate_limit_count": 0,
-            "top_products": pd.DataFrame(),
-            "top_questions": pd.DataFrame(),
-            "daily": pd.DataFrame(),
+# =========================================================
+# 고객 선택 처리
+# =========================================================
+def maybe_update_selected(user_text: str):
+    m = re.search(r"([123])번", user_text)
+    if not m: return
+    idx = int(m.group(1)) - 1
+    recs = st.session_state.last_recommendations or []
+    if 0 <= idx < len(recs):
+        row = recs[idx]
+        st.session_state.selected_product = {
+            "product_no": row.get("product_no", ""),
+            "product_name": row.get("product_name", ""),
+            "category": row_category(row),
+            "size_range": row.get("size_range", ""),
+            "fit": row.get("fit_type", ""),
         }
 
-    ts_valid = log_df.dropna(subset=["timestamp"]).copy() if "timestamp" in log_df.columns else pd.DataFrame()
-    today_df = get_today_log_df(log_df)
+# =========================================================
+# UI
+# =========================================================
+st.markdown("""
+<style>
+[data-testid="stToolbar"]{visibility:hidden;height:0;position:fixed;}
+#MainMenu{visibility:hidden;}
+footer{visibility:hidden;}
+.block-container{max-width:760px;padding-top:54px;padding-left:18px;padding-right:18px;padding-bottom:90px;}
+.miya-title-wrap{display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:4px;text-align:center;}
+.miya-title{font-size:30px;font-weight:900;letter-spacing:-1.2px;line-height:1.15;color:#1f2937;text-align:center;}
+.miya-title .accent{color:#0f766e;}
+.beta-badge{font-size:11px;background:#0f766e;color:#fff;border-radius:999px;padding:3px 8px;font-weight:700;}
+.miya-sub{color:#666;font-size:14px;margin-bottom:18px;text-align:center;}
+.chat-user{background:#e5f4ef;color:#12423a;border:1px solid #c6ded8;border-radius:18px 18px 4px 18px;padding:12px 14px;margin:8px 0 8px auto;max-width:82%;line-height:1.55;}
+.chat-bot{background:#08245a;color:#fff;border-radius:18px 18px 18px 4px;padding:13px 15px;margin:8px auto 8px 0;max-width:86%;line-height:1.58;white-space:normal;}
+.rec-list{margin-top:8px;}
+.rec-item{margin:5px 0;line-height:1.55;}
+.rec-item a{color:#fff;text-decoration:underline;font-weight:700;}
+.rec-tail{margin-top:8px;line-height:1.55;}
+.label{font-size:12px;color:#666;margin:8px 0 3px;font-weight:700;}
+.stTextInput input, .stSelectbox div[data-baseweb="select"]{border-radius:12px;}
+/* 사이즈 입력칸은 좁은 팝업/모바일에서도 2×2 기본 구조 유지 */
+div[data-testid="stHorizontalBlock"]{
+    display:flex !important;
+    flex-direction:row !important;
+    flex-wrap:nowrap !important;
+    gap:12px !important;
+    width:100% !important;
+}
+div[data-testid="stHorizontalBlock"] > div,
+div[data-testid="stHorizontalBlock"] [data-testid="column"]{
+    flex:1 1 0 !important;
+    min-width:0 !important;
+    width:50% !important;
+}
+@media (max-width: 640px){
+    div[data-testid="stHorizontalBlock"]{flex-direction:row !important;flex-wrap:nowrap !important;gap:10px !important;}
+    div[data-testid="stHorizontalBlock"] > div,
+    div[data-testid="stHorizontalBlock"] [data-testid="column"]{flex:1 1 0 !important;min-width:0 !important;width:50% !important;}
+}
 
-    question_mask = pd.Series([True] * len(log_df))
-    if "event_type" in log_df.columns:
-        question_mask = log_df["event_type"].astype(str).str.contains("question|user|message|chat", case=False, na=False)
-        if not question_mask.any():
-            question_mask = pd.Series([True] * len(log_df), index=log_df.index)
+</style>
+""", unsafe_allow_html=True)
 
-    today_question_mask = pd.Series(dtype=bool)
-    if not today_df.empty:
-        today_question_mask = today_df["event_type"].astype(str).str.contains("question|user|message|chat", case=False, na=False)
-        if not today_question_mask.any():
-            today_question_mask = pd.Series([True] * len(today_df), index=today_df.index)
+st.markdown('<div class="miya-title-wrap"><div class="miya-title">미샵 쇼핑친구 <span class="accent">픽톡</span></div><span class="beta-badge">BETA</span></div>', unsafe_allow_html=True)
+st.markdown('<div class="miya-sub">24시간 쇼핑 결정에 도움드리는 스마트한 쇼핑친구</div>', unsafe_allow_html=True)
 
-    today_consults = int(today_question_mask.sum()) if not today_df.empty else 0
-    today_sessions = int(today_df["session_id"].replace("", pd.NA).dropna().nunique()) if (not today_df.empty and "session_id" in today_df.columns) else 0
-    avg_latency = pd.to_numeric(today_df["latency_ms"], errors="coerce").dropna().mean() if (not today_df.empty and "latency_ms" in today_df.columns) else None
-    fallback_count = int(today_df["is_fallback"].sum()) if (not today_df.empty and "is_fallback" in today_df.columns) else 0
-    error_count = int(today_df["is_error"].sum()) if (not today_df.empty and "is_error" in today_df.columns) else 0
-    rate_limit_count = int(today_df["is_rate_limit"].sum()) if (not today_df.empty and "is_rate_limit" in today_df.columns) else 0
+qp = query_params()
+url = qp.get("url", "") or qp.get("product_url", "")
+product_no = qp.get("product_no", "")
+product_name = qp.get("product_name", "")
+current = fetch_product_context(url, product_no, product_name)
+context_key = f"{current.get('product_no','')}|{current.get('product_name','')}"
+if context_key != st.session_state.last_context_key:
+    st.session_state.last_context_key = context_key
+    st.session_state.messages = []
+    st.session_state.last_recommendations = []
+    st.session_state.selected_product = {}
 
-    top_products = pd.DataFrame()
-    if not today_df.empty and "product_no" in today_df.columns:
-        top_products = today_df[today_df["product_no"].astype(str) != ""].groupby(["product_no", "product_name"], dropna=False).agg(
-            상담수=("event_type", "size"),
-            임시답변전환=("is_fallback", "sum"),
-            평균응답ms=("latency_ms", "mean"),
-        ).reset_index().sort_values("상담수", ascending=False).head(10)
-
-    top_questions = pd.DataFrame()
-    if not today_df.empty and "user_text" in today_df.columns:
-        top_questions = today_df[today_df["user_text"].astype(str) != ""]["user_text"].value_counts().head(10).reset_index()
-        if not top_questions.empty:
-            top_questions.columns = ["질문", "횟수"]
-
-    daily = pd.DataFrame()
-    if not ts_valid.empty:
-        daily = ts_valid.groupby(ts_valid["timestamp"].dt.date).agg(
-            상담수=("event_type", "size"),
-            임시답변전환=("is_fallback", "sum"),
-            에러=("is_error", "sum"),
-            평균응답ms=("latency_ms", "mean"),
-        )
-
-    return {
-        "today_consults": today_consults,
-        "today_sessions": today_sessions,
-        "avg_latency": avg_latency,
-        "fallback_count": fallback_count,
-        "error_count": error_count,
-        "rate_limit_count": rate_limit_count,
-        "top_products": top_products,
-        "top_questions": top_questions,
-        "daily": daily,
-    }
-
-
-def render_common_upload_bar(current_db_df: pd.DataFrame, log_df: pd.DataFrame):
-    st.markdown("### 데이터 불러오기")
-    up1, up2 = st.columns(2)
-    with up1:
-        current_db_file = st.file_uploader("현재 미야언니 DB 업로드", type=["csv", "xlsx"], key="current_db_top")
-    with up2:
-        log_file = st.file_uploader("미야언니 V2 로그 업로드", type=["csv", "xlsx", "json", "jsonl", "log"], key="log_file_top")
-
-    folder_cols = st.columns([1.5, 1])
-    with folder_cols[0]:
-        folder_default = os.path.join(os.getcwd(), "logs")
-        folder_path = st.text_input("또는 logs 폴더 직접 읽기", value=folder_default, help="앱 폴더 안 logs 경로 또는 서버 내 로그 폴더 경로를 입력하세요.")
-    with folder_cols[1]:
-        use_folder = st.checkbox("logs 폴더 읽기 사용", value=False)
-
-    st.caption(
-        "미야언니 V2 로그 구조는 그대로 유지해서 읽습니다. "
-        "필수 기준 컬럼: timestamp, event_type, session_id, product_no, product_name, user_text, response_mode, fallback_reason, is_fallback, error_text, latency_ms"
-    )
-
-    if current_db_file is not None:
-        current_db_df = ensure_db_columns(parse_uploaded_table(current_db_file))
-
-    if log_file is not None:
-        raw_log_df = parse_uploaded_table(log_file)
-        log_df = normalize_log_df(raw_log_df) if raw_log_df is not None and not raw_log_df.empty else pd.DataFrame()
-    elif use_folder:
-        raw_log_df = load_logs_from_folder(folder_path)
-        log_df = normalize_log_df(raw_log_df) if raw_log_df is not None and not raw_log_df.empty else pd.DataFrame()
-
-    return current_db_df, log_df
-
-def render_dashboard(db_df: pd.DataFrame, log_df: pd.DataFrame):
-    st.subheader("메인 대시보드")
-    st.caption("총 상담 수, 일별 상담 수, fallback/error, 평균 응답속도를 한눈에 보는 화면입니다.")
-    if log_df is None or log_df.empty:
-        st.info("상단의 '데이터 불러오기'에서 미야언니 V2 로그 파일(.jsonl 또는 .log)을 업로드하거나, logs 폴더 읽기를 켜주세요.")
-
-    log_df = merge_db_names(log_df, db_df)
-    metrics = compute_overall_metrics(log_df)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("총 상담 수", f"{metrics['total_consults']:,}")
-    c2.metric("fallback 발생 횟수", f"{metrics['fallback_count']:,}")
-    c3.metric("error 발생 횟수", f"{metrics['error_count']:,}")
-    c4.metric("평균 응답 속도(ms)", f"{metrics['avg_latency']:,.0f}" if pd.notna(metrics['avg_latency']) else "-")
-
-    st.markdown("##### 일별 상담 수")
-    if metrics["daily_consults"] is not None and not metrics["daily_consults"].empty:
-        st.line_chart(metrics["daily_consults"])
-        daily_table = metrics["daily_consults"].reset_index()
-        daily_table.columns = ["날짜", "상담 수"]
-        st.dataframe(daily_table, use_container_width=True, hide_index=True)
-    else:
-        st.info("로그를 업로드하면 일별 상담 수가 표시됩니다.")
-
-    st.markdown("##### 빠른 운영 요약")
-    lower1, lower2 = st.columns(2)
-    with lower1:
-        product_top = compute_product_analysis(log_df).head(10)
-        st.markdown("###### 많이 질문되는 상품 TOP")
-        if not product_top.empty:
-            st.dataframe(product_top[["product_no", "product_name", "상품별 상담 수", "fallback 발생률(%)"]], use_container_width=True, hide_index=True, height=320)
-        else:
-            st.info("상품별 상담 데이터가 아직 없습니다.")
-    with lower2:
-        quality = compute_quality_analysis(log_df)
-        st.markdown("###### 오류 발생 로그")
-        if not quality["error_logs"].empty:
-            st.dataframe(quality["error_logs"].head(10), use_container_width=True, hide_index=True, height=320)
-        else:
-            st.info("오류 로그가 없습니다.")
-
-def render_product_analysis(db_df: pd.DataFrame, log_df: pd.DataFrame):
-    st.subheader("상품 분석")
-    st.caption("상품별 상담 수, 상품별 fallback 발생률, 많이 질문되는 상품을 확인합니다.")
-    log_df = merge_db_names(log_df, db_df)
-    product_stats = compute_product_analysis(log_df)
-    if product_stats.empty:
-        st.info("상품 로그가 아직 없습니다.")
-        return
+with st.expander("사이즈 입력 (더 구체적인 상담 가능)", expanded=True):
+    size_options = ["", "44", "55", "55반", "66", "66반", "77", "77반", "88", "99"]
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown("##### 많이 질문되는 상품 TOP")
-        st.dataframe(product_stats.head(20), use_container_width=True, hide_index=True, height=420)
+        st.session_state.body_height = st.text_input("키", value=st.session_state.body_height, placeholder="cm")
     with c2:
-        st.markdown("##### fallback 발생률 높은 상품")
-        high_fallback = product_stats[product_stats["상품별 상담 수"] > 0].sort_values(["fallback 발생률(%)", "fallback 발생 횟수"], ascending=[False, False]).head(20)
-        st.dataframe(high_fallback, use_container_width=True, hide_index=True, height=420)
+        st.session_state.body_weight = st.text_input("체중", value=st.session_state.body_weight, placeholder="kg")
+    c3, c4 = st.columns(2)
+    with c3:
+        current_top = st.session_state.body_top if st.session_state.body_top in size_options else ""
+        st.session_state.body_top = st.selectbox("상의", size_options, index=size_options.index(current_top), format_func=lambda x: x or "선택")
+    with c4:
+        current_bottom = st.session_state.body_bottom if st.session_state.body_bottom in size_options else ""
+        st.session_state.body_bottom = st.selectbox("하의", size_options, index=size_options.index(current_bottom), format_func=lambda x: x or "선택")
+    st.session_state.shoe_size = st.text_input("신발사이즈(선택)", value=st.session_state.shoe_size, placeholder="예: 235")
 
-def render_quality_analysis(log_df: pd.DataFrame):
-    st.subheader("상담 품질 분석")
-    st.caption("fallback 비율, response_mode 비율, 오류 발생 로그를 확인합니다.")
-    quality = compute_quality_analysis(log_df)
-    c1, c2 = st.columns(2)
-    c1.metric("fallback 비율", f"{quality['fallback_ratio']:.1f}%")
-    response_modes = quality["response_mode_ratio"]
-    if response_modes.empty:
-        c2.metric("response_mode 비율", "-")
+st.caption(f"현재 입력 정보: {body_summary()}")
+
+if not st.session_state.messages:
+    call = customer_call()
+    st.session_state.messages.append({"role":"assistant", "content":f"안녕하세요 :) {current.get('product_name','지금 보시는 상품')} 같이 봐드릴게요. 사이즈나 코디 고민 편하게 말씀해 주세요."})
+
+for msg in st.session_state.messages:
+    if msg["role"] == "user":
+        st.markdown(f'<div class="label" style="text-align:right;">{customer_call()}</div><div class="chat-user">{msg["content"]}</div>', unsafe_allow_html=True)
     else:
-        top_mode = response_modes.iloc[0]
-        c2.metric("주요 response_mode", f"{top_mode['response_mode']} ({top_mode['ratio']:.1f}%)")
+        st.markdown(f'<div class="label">미야언니</div><div class="chat-bot">{msg["content"]}</div>', unsafe_allow_html=True)
 
-    left, right = st.columns(2)
-    with left:
-        st.markdown("##### response_mode 비율")
-        if not response_modes.empty:
-            chart_df = response_modes.set_index("response_mode")[["count"]]
-            st.bar_chart(chart_df)
-            st.dataframe(response_modes, use_container_width=True, hide_index=True)
-        else:
-            st.info("assistant_response 로그가 없어서 response_mode 비율을 아직 계산할 수 없습니다.")
-    with right:
-        st.markdown("##### 오류 발생 로그 목록")
-        if not quality["error_logs"].empty:
-            st.dataframe(quality["error_logs"], use_container_width=True, hide_index=True, height=420)
-        else:
-            st.info("오류 로그가 없습니다.")
+user_input = st.chat_input("궁금한 점을 입력하세요")
+if user_input:
+    maybe_update_selected(user_input)
+    st.session_state.messages.append({"role":"user", "content":user_input})
+    answer = ""
+    intent = detect_intent(user_input)
+    is_recommendation_html = False
 
-def render_log_view(log_df: pd.DataFrame):
-    st.subheader("로그 조회")
-    st.caption("날짜별 / 이벤트 타입별 필터로 전체 로그를 확인합니다.")
-    template = build_log_template()
-    helper1, helper2 = st.columns([1.3, 1])
-    with helper1:
-        st.markdown("##### 로그 업로드 안내")
-        st.markdown(
-            "- 기본 방식은 CSV 업로드입니다.\n"
-            "- 또는 앱 폴더 안 `logs` 폴더를 직접 읽을 수 있습니다.\n"
-            "- event_type은 `user_message / assistant_response / fallback / error` 구조를 그대로 사용합니다."
-        )
-    with helper2:
-        st.download_button(
-            "로그 템플릿 다운로드",
-            data=template.to_csv(index=False).encode("utf-8-sig"),
-            file_name="miya_v2_log_template.csv",
-            mime="text/csv",
-            use_container_width=True,
-            key="log_view_template_download",
-        )
+    # 추천/코디/대체상품은 번호와 상품 링크가 꼬이지 않도록 코드가 직접 리스트를 만듭니다.
+    if intent in ["coordi_recommend", "alternative_recommend"]:
+        answer = build_recommendation_answer(user_input, current)
+        if answer:
+            is_recommendation_html = True
 
-    if log_df is None or log_df.empty:
-        st.info("로그 파일을 업로드하거나 logs 폴더 읽기를 사용하면 여기에 전체 로그가 표시됩니다.")
-        return
+    if not answer:
+        answer = fast_answer(user_input, current)
+    if not answer:
+        answer = call_gpt(user_input, current)
+    if not answer or len(clean_text(answer)) < 10:
+        answer = fallback_answer(user_input, current)
 
-    valid_ts = log_df.dropna(subset=["timestamp"])
-    if not valid_ts.empty:
-        min_date = valid_ts["timestamp"].dt.date.min()
-        max_date = valid_ts["timestamp"].dt.date.max()
-        default_range = (min_date, max_date)
-    else:
-        today = datetime.now().date()
-        default_range = (today, today)
-
-    filter1, filter2 = st.columns(2)
-    with filter1:
-        date_range = st.date_input("날짜 범위", value=default_range, key="log_date_range")
-    with filter2:
-        event_options = [x for x in ["user_message", "assistant_response", "fallback", "error"] if x in set(log_df["event_type"].dropna().astype(str))]
-        selected_events = st.multiselect("이벤트 타입 필터", options=event_options, default=event_options, key="log_event_filter")
-
-    filtered = filter_log_df(log_df, date_range=date_range, event_types=selected_events)
-    st.markdown(f"##### 전체 로그 테이블 ({len(filtered):,}건)")
-
-    # 표시 컬럼 선택
-    display_cols = [c for c in [
-        "timestamp", "event_type", "session_id", "product_no", "product_name",
-        "user_text", "bot_text", "response_mode", "fallback_reason",
-        "is_fallback", "latency_ms", "error_text"
-    ] if c in filtered.columns]
-    st.dataframe(filtered[display_cols], use_container_width=True, hide_index=True, height=520)
-
-    st.download_button(
-        "필터 결과 CSV 다운로드",
-        data=filtered.to_csv(index=False).encode("utf-8-sig"),
-        file_name="miya_v2_logs_filtered.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="filtered_logs_download",
-    )
-
-    # ── 세션별 대화 상세 보기
-    st.markdown("##### 세션별 대화 상세 보기")
-    if "session_id" in filtered.columns:
-        session_list = [s for s in filtered["session_id"].dropna().unique().tolist() if s and s != "nan"]
-        if session_list:
-            selected_sess = st.selectbox("세션 선택", options=["전체"] + session_list[:50], key="sess_select")
-            if selected_sess != "전체":
-                sess_df = filtered[filtered["session_id"] == selected_sess].sort_values("timestamp")
-                for _, row in sess_df.iterrows():
-                    evt = str(row.get("event_type", ""))
-                    ts = str(row.get("timestamp", ""))[:19]
-                    pname = str(row.get("product_name", "") or row.get("product_no", ""))
-                    if "user" in evt:
-                        st.markdown(
-                            f'<div style="text-align:right;margin:4px 0;">'
-                            f'<span style="font-size:11px;color:#888;">{ts} | {pname}</span><br>'
-                            f'<span style="background:#dff0ec;padding:6px 12px;border-radius:12px;display:inline-block;">'
-                            f'{html.escape(str(row.get("user_text",""))[:200])}</span></div>',
-                            unsafe_allow_html=True
-                        )
-                    elif "assistant" in evt or "response" in evt:
-                        mode = str(row.get("response_mode", ""))
-                        latency = row.get("latency_ms", "")
-                        latency_str = f" | {latency:.0f}ms" if pd.notna(latency) and latency else ""
-                        fb_badge = " 🔄fallback" if row.get("is_fallback") else ""
-                        st.markdown(
-                            f'<div style="text-align:left;margin:4px 0;">'
-                            f'<span style="font-size:11px;color:#888;">{ts} | {mode}{latency_str}{fb_badge}</span><br>'
-                            f'<span style="background:#071b4e;color:#fff;padding:6px 12px;border-radius:12px;display:inline-block;">'
-                            f'{html.escape(str(row.get("bot_text",""))[:300])}</span></div>',
-                            unsafe_allow_html=True
-                        )
-                    elif "error" in evt:
-                        st.error(f"[{ts}] {row.get('error_text','')}")
-        else:
-            st.info("세션 ID가 있는 로그가 없어요. 미야언니 V2 최신 버전에서 생성된 로그인지 확인해주세요.")
-    else:
-        st.info("세션 ID 컬럼이 없어요.")
-
-def render_db_generation():
-    st.subheader("자동 상품DB 생성")
-    st.caption("형준님이 이미 만든 DB생성기 출력 구조에 맞춰 misharp_miya_db.csv 형태로 생성합니다.")
-
-    set1, set2, set3 = st.columns(3)
-    with set1:
-        use_openai = st.toggle("OpenAI 정규화", value=False)
-    with set2:
-        max_products = st.number_input("카테고리 최대 수집 수", min_value=1, max_value=2000, value=500, step=50)
-    with set3:
-        delay_sec = st.slider("요청 간 딜레이(초)", min_value=0.0, max_value=2.0, value=0.2, step=0.1)
-
-    input_text = st.text_area(
-        "상품 URL / 카테고리 URL 입력",
-        height=180,
-        placeholder="https://www.misharp.co.kr/product/list.html?cate_no=541\nhttps://www.misharp.co.kr/product/detail.html?product_no=28579",
-    )
-
-    col1, col2 = st.columns(2)
-    preview_only = col1.button("카테고리 상품 URL 미리보기", use_container_width=True)
-    run = col2.button("DB 생성 시작", type="primary", use_container_width=True)
-
-    if preview_only and input_text.strip():
-        urls = [clean_text(x) for x in re.split(r"[\n,]", input_text) if clean_text(x)]
-        preview_rows = []
-        for u in urls:
-            if is_category_url(u):
-                cards, total_count = collect_product_cards_from_category(u, max_products=max_products, delay_sec=delay_sec)
-                for c in cards:
-                    preview_rows.append({"product_no": c["product_no"], "product_name": c["card_name"], "product_url": c["product_url"]})
-                st.info(f"카테고리 예상 TOTAL: {total_count or '미확인'} / 실제 수집: {len(cards)}")
-            elif is_product_url(u):
-                preview_rows.append({"product_no": extract_product_no(u), "product_name": "", "product_url": normalize_product_url(u)})
-        if preview_rows:
-            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
-
-    if run and input_text.strip():
-        df, audit = analyze_urls(input_text, use_openai, delay_sec, max_products)
-        st.success(f"최종 DB 행 수: {len(df)}")
-        st.dataframe(df, use_container_width=True, height=420)
-        st.download_button("misharp_miya_db.csv 다운로드", data=df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db.csv", mime="text/csv", use_container_width=True, key="db_generation_download")
-
-        if audit:
-            audit_df = pd.DataFrame(audit)
-            st.markdown("##### 수집 감사 로그")
-            st.dataframe(audit_df, use_container_width=True)
-            st.download_button("audit CSV 다운로드", data=audit_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db_audit.csv", mime="text/csv", use_container_width=True, key="db_audit_download")
-
-
-def render_db_compare(current_db_df: pd.DataFrame):
-    st.subheader("반자동 DB업로드 준비")
-    st.caption("현재 DB와 신규 생성 DB를 비교해서 전체 교체용과 신규 상품용 파일을 내려받는 화면입니다.")
-
-    new_db_file = st.file_uploader("신규 생성 DB 업로드 (CSV/XLSX)", type=["csv", "xlsx"], key="new_db_upload")
-    if new_db_file is None:
-        st.info("신규 생성된 DB 파일을 올리면 현재 DB와 비교해서 추가/삭제/변경 상품을 보여드립니다.")
-        return
-
-    new_db_df = ensure_db_columns(parse_uploaded_table(new_db_file))
-    if new_db_df is None or new_db_df.empty:
-        st.error("신규 DB를 읽지 못했습니다.")
-        return
-
-    current_db_df = ensure_db_columns(current_db_df)
-    added_df, removed_df, changed_df = compare_db(current_db_df, new_db_df)
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("현재 DB 상품 수", f"{len(current_db_df):,}")
-    c2.metric("신규 DB 상품 수", f"{len(new_db_df):,}")
-    c3.metric("신규 추가 상품", f"{len(added_df):,}")
-    c4.metric("변경 상품", f"{len(changed_df):,}")
-
-    tab1, tab2, tab3 = st.tabs(["신규 추가", "삭제 후보", "변경 상품"])
-    with tab1:
-        st.dataframe(added_df, use_container_width=True, height=360)
-    with tab2:
-        st.dataframe(removed_df, use_container_width=True, height=360)
-    with tab3:
-        st.dataframe(changed_df, use_container_width=True, height=360)
-
-    st.markdown("##### 반영용 파일 다운로드")
-    dl1, dl2 = st.columns(2)
-    dl1.download_button("전체 교체용 misharp_miya_db.csv 다운로드", data=new_db_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db.csv", mime="text/csv", use_container_width=True, key="compare_full_db_download")
-    dl2.download_button("신규 상품만 별도 다운로드", data=added_df.to_csv(index=False).encode("utf-8-sig"), file_name="misharp_miya_db_new_only.csv", mime="text/csv", use_container_width=True, key="compare_added_only_download")
-
-    st.markdown("##### 실무 반영 순서")
-    st.markdown(
-        "1. 여기서 **전체 교체용 misharp_miya_db.csv**를 다운로드합니다.\n"
-        "2. 미야언니 V2 레포의 기존 `misharp_miya_db.csv`를 같은 파일명으로 덮어씁니다.\n"
-        "3. GitHub 커밋 후 Streamlit 재배포 또는 재부팅합니다.\n"
-        "4. 불안하면 신규 상품 파일로 먼저 점검 후 전체 교체하세요."
-    )
-
-
-def render_stats(log_df: pd.DataFrame, db_df: pd.DataFrame):
-    render_quality_analysis(log_df)
-
-def main():
-    st.title("미야언니 관리프로그램")
-    st.caption("자동 상품DB 생성 · 반자동 DB업로드 준비 · 미야언니 V2 로그 기반 통계/품질 분석")
-
-    st.markdown(
-        """
-        <style>
-        div[data-baseweb="tab-list"] button {
-            font-size: 15px !important;
-            font-weight: 700 !important;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    current_db_df = pd.DataFrame(columns=DB_COLUMNS)
-    log_df = pd.DataFrame()
-    current_db_df, log_df = render_common_upload_bar(current_db_df, log_df)
-
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "메인 대시보드", "상품 분석", "상담 품질 분석", "로그 조회", "자동 상품DB 생성", "반자동 DB업로드 준비"
-    ])
-    with tab1:
-        render_dashboard(current_db_df, log_df)
-    with tab2:
-        render_product_analysis(current_db_df, log_df)
-    with tab3:
-        render_quality_analysis(log_df)
-    with tab4:
-        render_log_view(log_df)
-    with tab5:
-        render_db_generation()
-    with tab6:
-        render_db_compare(current_db_df)
-
-    st.markdown("---")
-    st.caption("made by MISHARP COMPANY, MIYAWA. 2006. All rights reserved.")
-
-
-
-if __name__ == "__main__":
-    main()
+    if not is_recommendation_html:
+        answer = safe_postprocess(answer, customer_call())
+    st.session_state.messages.append({"role":"assistant", "content":answer})
+    st.rerun()
